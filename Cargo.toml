@@ -1,0 +1,50 @@
+[package]
+name = "rookd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Security-first HTTP reverse proxy and load balancer"
+publish = false
+
+[[bin]]
+name = "framing-fuzz"
+path = "fuzz/framing_fuzz.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server", "server-auto", "server-graceful", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "time", "x509-parser", "hyper-rustls", "rcgen"] }
+ipnet = "2"
+pin-project-lite = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "2"
+time = "0.3.47"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x509-parser = "0.18"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

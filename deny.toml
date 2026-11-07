@@ -1,0 +1,26 @@
+[advisories]
+unmaintained = "workspace"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[licenses]
+private = { ignore = true }
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = [
+    { name = "LLVM-exception", allow = [] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
