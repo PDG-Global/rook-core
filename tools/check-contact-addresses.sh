@@ -27,7 +27,7 @@ MAIL_DOMAINS=$(awk -F'\t' '!/^#/ && $1!="domain" && NF>=2 && $2!="NONE" { print 
 
 is_reserved() {
   case "$1" in
-    example.com|example.net|example.org|example.*|*.example|*.test|*.invalid|*.local|*.localhost|localhost)
+    example.com|example.net|example.org|*.example|*.test|*.invalid|*.local|*.localhost|localhost)
       return 0 ;;
   esac
   return 1
@@ -81,7 +81,7 @@ if [ "$fails" -gt 0 ]; then
       dig +short TXT <domain> | grep spf
       dig +short TXT _dmarc.<domain>
 
-  Add the domain to MAIL_DOMAINS once verified.
+  Add the domain to tools/mail-domains.tsv once verified (MX, SPF, DMARC, today's date).
 EOF
   echo "CONTACT ADDRESSES: $fails unacceptable address(es)." >&2
   exit 1
