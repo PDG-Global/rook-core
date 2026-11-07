@@ -64,7 +64,7 @@ When you submit your first pull request, a bot will ask you to sign the CLA.
 ### Documentation
 
 - Add doc comments (`///`) for public APIs
-- Update relevant documentation in `docs/`
+- Update relevant documentation in `README.md`
 - Include examples in doc comments where helpful
 
 ### Testing
