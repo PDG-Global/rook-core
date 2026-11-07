@@ -9,7 +9,9 @@
 # Usage: check-contact-addresses.sh <dir> [more dirs...]
 # Exit:  0 all addresses fine · 1 offender(s) found · 2 usage/scan error
 #
-# Rule: an address is acceptable if its domain is RFC 2606/6761 reserved (documentation examples) or is
+# Rule: an address is acceptable if its domain is reserved for documentation — RFC 2606
+# (.test/.example/.invalid/.localhost plus the three example second-level domains) or `.local`
+# via RFC 6762 (mDNS, IANA Special-Use registry per RFC 6761) — or is
 # listed in MAIL_DOMAINS below. Anything else must be added deliberately, after confirming the domain has
 # an MX record — see the note printed on failure.
 
