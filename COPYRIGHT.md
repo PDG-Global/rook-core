@@ -21,7 +21,7 @@ Email: legal@pdg-global.com
 This software is dual-licensed:
 
 1. **GNU Affero General Public License v3.0 (AGPL-3.0)**
-   - For non-commercial and open source use
+   - For any use, including commercial, provided you meet its terms
    - See LICENSE for full terms
 
 2. **Commercial License**
