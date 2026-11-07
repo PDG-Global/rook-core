@@ -1,0 +1,17 @@
+# Mail posture of every domain we publish a contact address on, or might.
+#
+# Consumer: tools/check-contact-addresses.sh (static allowlist — no network)
+# Re-verifier: tools/check-mail-domains.sh (queries DNS, run on a schedule — never blocks a deploy)
+#
+# Exactly six tab-separated fields per row, no padding, NONE where absent:
+#   domain <TAB> mx_host <TAB> spf <TAB> dmarc_policy <TAB> verified
+#
+# Adding a domain: run the three queries (see check-mail-domains.sh --help), fill in the answer, set
+# verified to today. A row whose posture no longer matches reality is a finding in EITHER direction:
+# a mail domain losing MX breaks published addresses, and a no-mail domain gaining MX means the
+# "never publish an address there" rule has quietly become wrong.
+domain	mx_host	spf	dmarc_policy	verified
+pdg-global.com	mail.pdg-global.com	v=spf1 mx ra=postmaster -all	reject	2026-11-07
+rcommerce.app	mail.pdg-global.com	v=spf1 mx ra=postmaster -all	reject	2026-11-07
+rvpn.org	NONE	NONE	NONE	2026-11-07
+rookserver.app	NONE	NONE	NONE	2026-11-07

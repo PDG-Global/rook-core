@@ -25,3 +25,10 @@ We will acknowledge receipt of your vulnerability report within 48 hours and wil
 - **Mitigation**: Any suggested fixes or workarounds
 - **Your contact**: How to reach you for follow-up questions
 - **Disclosure preference**: Your preferred timeline for public disclosure
+
+## A Note on Contact Domains
+
+All published contact addresses for Rook are on `pdg-global.com`, which has
+MX, SPF and DMARC records and accepts mail. `rookserver.app` publishes no
+mail service — do not move contact addresses there. `tools/check-contact-addresses.sh`
+enforces this in review.
