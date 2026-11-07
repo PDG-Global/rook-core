@@ -15,9 +15,13 @@
 
 set -u
 
-# Domains we have verified accept mail: MX present, SPF published, DMARC enforcing.
-# Add a domain here only after checking its MX record.
-MAIL_DOMAINS="pdg-global.com"
+# Allowlist comes from tools/mail-domains.tsv, the same file the scheduled re-verifier reads — one source
+# of truth, so the static check and the DNS check can never disagree about which domains count as mail-capable.
+# Domains whose posture is NONE there are, by definition, not allowed to carry a published address.
+tsv=$(dirname "$0")/mail-domains.tsv
+[ -r "$tsv" ] || { echo "ERROR: cannot read $tsv" >&2; exit 2; }
+MAIL_DOMAINS=$(awk -F'\t' '!/^#/ && $1!="domain" && NF>=2 && $2!="NONE" { print $1 }' "$tsv" | tr '\n' ' ')
+[ -n "$MAIL_DOMAINS" ] || { echo "ERROR: no mail-capable domains in $tsv" >&2; exit 2; }
 
 [ $# -ge 1 ] || { echo "usage: $0 <dir> [more dirs...]" >&2; exit 2; }
 
@@ -40,9 +44,11 @@ scanned=0
 
 for dir in "$@"; do
   [ -d "$dir" ] || { echo "ERROR: not a directory: $dir" >&2; exit 2; }
-  # only text files we publish; skip binaries, lockfiles and vendored trees
+  # text files we publish, INCLUDING *.py: the site generator (site/gen.py) and its emitted HTML must
+  # both be clean, or a hand-edited page ships an address the template no longer contains.
+  # Skip binaries, lockfiles and vendored trees.
   find "$dir" -type f \
-    \( -name '*.md' -o -name '*.html' -o -name '*.toml' -o -name '*.yml' -o -name '*.yaml' -o -name '*.txt' -o -name '*.json' \) \
+    \( -name '*.md' -o -name '*.html' -o -name '*.py' -o -name '*.toml' -o -name '*.yml' -o -name '*.yaml' -o -name '*.txt' -o -name '*.json' \) \
     ! -path '*/node_modules/*' ! -path '*/.git/*' ! -name 'package-lock.json' 2>/dev/null \
   | while IFS= read -r f; do
       grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$f" 2>/dev/null \
