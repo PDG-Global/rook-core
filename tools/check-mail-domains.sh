@@ -58,6 +58,13 @@ while IFS="$(printf '\t')" read -r domain want_mx want_spf want_dmarc verified; 
     printf '  ok     %-16s %s  (table verified %s)\n' "$domain" "$want_mx / $want_dmarc" "$verified"
   else
     drift=$((drift + 1))
+    if [ "$want_mx" != NONE ]; then
+      printf '  hint   %s: table says this domain accepts mail — published addresses on it may be broken; fix the domain, or update the row if the change is intended\n' "$domain"
+    elif [ "$got_mx" = NONE ]; then
+      printf '  hint   %s: still accepts no mail — it gained explicit anti-spoofing records (v=spf1 -all / DMARC reject), the no-mail posture; update the row, nothing else changes\n' "$domain"
+    else
+      printf '  hint   %s: a no-mail domain gained MX — it may now accept mail, so "never publish an address there" is out of date; re-verify, then update the table and the checker together\n' "$domain"
+    fi
   fi
 done < "$tsv"
 
@@ -71,8 +78,11 @@ if [ "$drift" -gt 0 ]; then
 
   The world disagrees with tools/mail-domains.tsv. Two directions, both matter:
     - a MAIL domain lost MX/SPF/DMARC  -> published addresses on it are now broken; fix the domain.
-    - a NO-MAIL domain gained them     -> it now accepts mail, so "never publish an address there"
-                                          is out of date; update the table and the checker together.
+    - a NO-MAIL domain gained MX       -> it may now accept mail, so "never publish an address
+                                          there" is out of date; update table and checker together.
+    - a NO-MAIL domain gained only SPF -all / DMARC reject
+                                       -> that IS the no-mail posture made explicit; just update
+                                          the row (see the per-row hints above).
   Re-run the three queries, then update the row and its verified date.
 EOF
   echo "MAIL DOMAINS: $drift of $checked row(s) drifted." >&2

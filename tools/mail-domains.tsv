@@ -3,7 +3,7 @@
 # Consumer: tools/check-contact-addresses.sh (static allowlist — no network)
 # Re-verifier: tools/check-mail-domains.sh (queries DNS, run on a schedule — never blocks a deploy)
 #
-# Exactly six tab-separated fields per row, no padding, NONE where absent:
+# Exactly five tab-separated fields per row, no padding, NONE where absent:
 #   domain <TAB> mx_host <TAB> spf <TAB> dmarc_policy <TAB> verified
 #
 # Adding a domain: run the three queries (see check-mail-domains.sh --help), fill in the answer, set
