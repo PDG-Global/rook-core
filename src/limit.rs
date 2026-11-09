@@ -8,7 +8,7 @@ use std::{
 const IDLE_RATE_ENTRY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum ClientKey {
+pub(crate) enum ClientKey {
     Ipv4(std::net::Ipv4Addr),
     Ipv6Network(Ipv6Addr),
 }

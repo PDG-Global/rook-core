@@ -3007,3 +3007,118 @@ fn deterministic_malformed_config_fuzz_never_panics() {
         );
     }
 }
+
+#[tokio::test]
+async fn unknown_host_strikes_ban_and_log_only_does_not() {
+    let (upstream, _guard) = spawn_identity_upstream("ok").await;
+    // Enforcing server-wide strikes: threshold 2, short ban.
+    let rook = spawn_rook(
+        &[upstream],
+        "[server.strikes]\nenabled = true\nlog_only = false\nthreshold = 2\nwindow_secs = 60\nban_secs = 60\n",
+        "",
+    )
+    .await;
+    for _ in 0..2 {
+        let r = send_request(
+            rook.addr,
+            "GET / HTTP/1.1\r\nHost: unknown.example\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(r.status, 404);
+    }
+    // Third request from the banned client is refused before any work.
+    let r = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 403);
+}
+
+#[tokio::test]
+async fn unknown_host_strikes_log_only_never_bans() {
+    let (upstream, _guard) = spawn_identity_upstream("ok").await;
+    let rook = spawn_rook(
+        &[upstream],
+        "[server.strikes]\nenabled = true\nthreshold = 2\nwindow_secs = 60\nban_secs = 60\n",
+        "",
+    )
+    .await;
+    for _ in 0..5 {
+        let r = send_request(
+            rook.addr,
+            "GET / HTTP/1.1\r\nHost: unknown.example\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(r.status, 404);
+    }
+    // Past the threshold in log-only mode: the site still answers.
+    let r = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 200);
+}
+
+#[tokio::test]
+async fn trap_paths_strike_the_site_tracker() {
+    let (upstream, _guard) = spawn_identity_upstream("ok").await;
+    let rook = spawn_rook(
+        &[upstream],
+        "",
+        "\n[sites.strikes]\nenabled = true\nlog_only = false\nthreshold = 1\nwindow_secs = 60\nban_secs = 60\ntrap_paths = [\"/wp-admin\"]\n",
+    )
+    .await;
+    // One touch of the trap path: 404 and a strike; threshold 1 bans.
+    let r = send_request(
+        rook.addr,
+        "GET /wp-admin HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 404);
+    // The next request to the site is refused.
+    let r = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 403);
+}
+
+#[tokio::test]
+async fn strikes_key_on_the_verified_visitor_not_the_proxy() {
+    let (upstream, _guard) = spawn_identity_upstream("ok").await;
+    // The "Cloudflare range" here is loopback, so the test's direct peer
+    // is trusted; visitors arrive via CF-Connecting-IP.
+    let rook = spawn_rook(
+        &[upstream],
+        "cloudflare_ranges = [\"127.0.0.0/8\"]\n[server.strikes]\nenabled = true\nlog_only = false\nthreshold = 2\nwindow_secs = 60\nban_secs = 60\n",
+        "",
+    )
+    .await;
+    // Visitor 1.2.3.4 trips the unknown-host threshold.
+    for _ in 0..2 {
+        let r = send_request(
+            rook.addr,
+            "GET / HTTP/1.1\r\nHost: unknown.example\r\nCF-Connecting-IP: 1.2.3.4\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(r.status, 404);
+    }
+    // Visitor 1.2.3.4 is now banned even on the real site.
+    let r = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nCF-Connecting-IP: 1.2.3.4\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    // Visitor 5.6.7.8 is unaffected — and the proxy itself was never
+    // struck, or every visitor would be banned now.
+    let r = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nCF-Connecting-IP: 5.6.7.8\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 200);
+}

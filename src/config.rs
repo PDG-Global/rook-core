@@ -46,6 +46,13 @@ pub struct ServerConfig {
     pub shutdown_drain: Duration,
     pub trusted_proxies: Vec<IpNet>,
     pub cloudflare_ranges: Vec<IpNet>,
+    /// Server-wide strike rules for the pre-site offences (malformed
+    /// requests, unknown hosts, failed handshakes).
+    pub strikes: StrikeRulesConfig,
+    /// Addresses that are never struck or banned (operator allowlist).
+    /// The trusted proxies and Cloudflare ranges are exempt on top of
+    /// this, always.
+    pub strike_allowlist: Vec<IpNet>,
 }
 
 /// Per-site ACME certificate management settings.
@@ -66,6 +73,32 @@ pub struct SiteConfig {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub routes: Vec<RouteConfig>,
+    pub strikes: StrikeRulesConfig,
+}
+
+/// Per-site strike/ban rules (plan §6). `None` disables the tracker for
+/// the site; present-but-`log_only` is the default way to turn it on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrikeRulesConfig {
+    pub enabled: bool,
+    pub log_only: bool,
+    pub threshold: u32,
+    pub window_secs: u64,
+    pub ban_secs: u64,
+    pub trap_paths: Vec<String>,
+}
+
+impl Default for StrikeRulesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            log_only: true,
+            threshold: 10,
+            window_secs: 600,
+            ban_secs: 3600,
+            trap_paths: Vec::new(),
+        }
+    }
 }
 
 /// Route matching and upstream policy.
@@ -149,6 +182,8 @@ struct RawServerConfig {
     shutdown_drain: u64,
     trusted_proxies: Vec<String>,
     cloudflare_ranges: Vec<String>,
+    strikes: Option<RawStrikeRulesConfig>,
+    strike_allowlist: Vec<String>,
 }
 
 impl Default for RawServerConfig {
@@ -179,6 +214,8 @@ impl Default for RawServerConfig {
             shutdown_drain: 15,
             trusted_proxies: Vec::new(),
             cloudflare_ranges: Vec::new(),
+            strikes: None,
+            strike_allowlist: Vec::new(),
         }
     }
 }
@@ -213,6 +250,32 @@ struct RawSiteConfig {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     routes: Vec<RawRouteConfig>,
+    strikes: Option<RawStrikeRulesConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawStrikeRulesConfig {
+    enabled: bool,
+    log_only: bool,
+    threshold: u32,
+    window_secs: u64,
+    ban_secs: u64,
+    trap_paths: Vec<String>,
+}
+
+impl Default for RawStrikeRulesConfig {
+    fn default() -> Self {
+        let d = StrikeRulesConfig::default();
+        Self {
+            enabled: d.enabled,
+            log_only: d.log_only,
+            threshold: d.threshold,
+            window_secs: d.window_secs,
+            ban_secs: d.ban_secs,
+            trap_paths: d.trap_paths,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -285,6 +348,41 @@ fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
         })?;
         cloudflare_ranges.push(network);
     }
+    let mut strike_allowlist = Vec::with_capacity(raw.strike_allowlist.len());
+    for (index, entry) in raw.strike_allowlist.iter().enumerate() {
+        let network = entry.parse::<IpNet>().map_err(|error| {
+            validation(
+                format!("server.strike_allowlist[{index}]"),
+                format!("invalid IP network or CIDR: {error}"),
+            )
+        })?;
+        strike_allowlist.push(network);
+    }
+    let strikes = match raw.strikes {
+        Some(raw_strikes) => {
+            if raw_strikes.threshold == 0 {
+                return Err(validation(
+                    "server.strikes.threshold".to_string(),
+                    "must be at least 1",
+                ));
+            }
+            if raw_strikes.window_secs == 0 || raw_strikes.ban_secs == 0 {
+                return Err(validation(
+                    "server.strikes".to_string(),
+                    "window_secs and ban_secs must be non-zero",
+                ));
+            }
+            StrikeRulesConfig {
+                enabled: raw_strikes.enabled,
+                log_only: raw_strikes.log_only,
+                threshold: raw_strikes.threshold,
+                window_secs: raw_strikes.window_secs,
+                ban_secs: raw_strikes.ban_secs,
+                trap_paths: raw_strikes.trap_paths,
+            }
+        }
+        None => StrikeRulesConfig::default(),
+    };
 
     let server = ServerConfig {
         listen,
@@ -312,6 +410,8 @@ fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
         shutdown_drain: Duration::from_secs(raw.shutdown_drain),
         trusted_proxies,
         cloudflare_ranges,
+        strikes,
+        strike_allowlist,
     };
     server.validate()?;
     Ok(server)
@@ -492,12 +592,64 @@ fn parse_site(
         routes.push(route);
     }
 
+    let strikes = match raw.strikes {
+        Some(raw_strikes) => {
+            let base = format!("sites[{site_index}].strikes");
+            if raw_strikes.threshold == 0 {
+                return Err(validation(
+                    format!("{base}.threshold"),
+                    "must be at least 1",
+                ));
+            }
+            if raw_strikes.window_secs == 0 {
+                return Err(validation(
+                    format!("{base}.window_secs"),
+                    "must be non-zero; zero would silently disable counting",
+                ));
+            }
+            if raw_strikes.ban_secs == 0 {
+                return Err(validation(
+                    format!("{base}.ban_secs"),
+                    "must be non-zero; zero would silently disable bans",
+                ));
+            }
+            let mut trap_paths = Vec::with_capacity(raw_strikes.trap_paths.len());
+            for (i, path) in raw_strikes.trap_paths.iter().enumerate() {
+                if !path.starts_with('/') || path.contains('?') || path.contains('#') {
+                    return Err(validation(
+                        format!("{base}.trap_paths[{i}]"),
+                        "must be an absolute path without query or fragment",
+                    ));
+                }
+                // Normalized the same way request paths are, so a
+                // configured trap can always match.
+                let normalized = crate::path::normalize_path(path).map_err(|_| {
+                    validation(
+                        format!("{base}.trap_paths[{i}]"),
+                        "is not a normalizable path".to_string(),
+                    )
+                })?;
+                trap_paths.push(normalized);
+            }
+            StrikeRulesConfig {
+                enabled: raw_strikes.enabled,
+                log_only: raw_strikes.log_only,
+                threshold: raw_strikes.threshold,
+                window_secs: raw_strikes.window_secs,
+                ban_secs: raw_strikes.ban_secs,
+                trap_paths,
+            }
+        }
+        None => StrikeRulesConfig::default(),
+    };
+
     Ok(SiteConfig {
         acme,
         hosts,
         tls_cert,
         tls_key,
         routes,
+        strikes,
     })
 }
 

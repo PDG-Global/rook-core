@@ -10,4 +10,5 @@ pub mod limit;
 pub mod path;
 pub mod proxy;
 pub mod server;
+pub mod strike;
 pub mod trust;
