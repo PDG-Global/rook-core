@@ -196,7 +196,9 @@ fn disabled_rules_are_inert() {
         StrikeOutcome::Noted
     );
     assert!(!t.is_banned(ip(1)));
-    let (_, bans, would_ban, _) = t.metrics();
+    // And it stays out of the metrics entirely.
+    let (strikes, bans, would_ban, _) = t.metrics();
+    assert!(strikes.is_empty());
     assert_eq!(bans + would_ban, 0);
 }
 

@@ -287,3 +287,33 @@ impl StrikeTracker {
         (m.strikes.clone(), m.bans, m.would_ban, m.rejected)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The integration tests cannot see the per-client strike vec, so the
+    //! cap's pin lives here: delete the guard and this test fails.
+
+    use super::*;
+
+    #[test]
+    fn the_strike_vec_stops_at_the_threshold() {
+        let t = StrikeTracker::new(
+            StrikeRules {
+                enabled: true,
+                log_only: true,
+                threshold: 3,
+                ..StrikeRules::default()
+            },
+            8,
+            Duration::from_secs(60),
+            Vec::new(),
+        );
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        for _ in 0..10_000 {
+            t.strike(ip, StrikeReason::MalformedRequest);
+        }
+        let st = lock_recover(&t.inner.state);
+        let c = st.clients.get(&ClientKey::from(ip)).expect("tracked");
+        assert_eq!(c.strikes.len(), 3);
+    }
+}
