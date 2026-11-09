@@ -66,6 +66,32 @@ pub struct SiteConfig {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub routes: Vec<RouteConfig>,
+    pub strikes: StrikeRulesConfig,
+}
+
+/// Per-site strike/ban rules (plan §6). `None` disables the tracker for
+/// the site; present-but-`log_only` is the default way to turn it on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrikeRulesConfig {
+    pub enabled: bool,
+    pub log_only: bool,
+    pub threshold: u32,
+    pub window_secs: u64,
+    pub ban_secs: u64,
+    pub trap_paths: Vec<String>,
+}
+
+impl Default for StrikeRulesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            log_only: true,
+            threshold: 10,
+            window_secs: 600,
+            ban_secs: 3600,
+            trap_paths: Vec::new(),
+        }
+    }
 }
 
 /// Route matching and upstream policy.
@@ -213,6 +239,32 @@ struct RawSiteConfig {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     routes: Vec<RawRouteConfig>,
+    strikes: Option<RawStrikeRulesConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawStrikeRulesConfig {
+    enabled: bool,
+    log_only: bool,
+    threshold: u32,
+    window_secs: u64,
+    ban_secs: u64,
+    trap_paths: Vec<String>,
+}
+
+impl Default for RawStrikeRulesConfig {
+    fn default() -> Self {
+        let d = StrikeRulesConfig::default();
+        Self {
+            enabled: d.enabled,
+            log_only: d.log_only,
+            threshold: d.threshold,
+            window_secs: d.window_secs,
+            ban_secs: d.ban_secs,
+            trap_paths: d.trap_paths,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -492,12 +544,42 @@ fn parse_site(
         routes.push(route);
     }
 
+    let strikes = match raw.strikes {
+        Some(raw_strikes) => {
+            let base = format!("sites[{site_index}].strikes");
+            if raw_strikes.threshold == 0 {
+                return Err(validation(
+                    format!("{base}.threshold"),
+                    "must be at least 1",
+                ));
+            }
+            for (i, path) in raw_strikes.trap_paths.iter().enumerate() {
+                if !path.starts_with('/') || path.contains('?') || path.contains('#') {
+                    return Err(validation(
+                        format!("{base}.trap_paths[{i}]"),
+                        "must be an absolute path without query or fragment",
+                    ));
+                }
+            }
+            StrikeRulesConfig {
+                enabled: raw_strikes.enabled,
+                log_only: raw_strikes.log_only,
+                threshold: raw_strikes.threshold,
+                window_secs: raw_strikes.window_secs,
+                ban_secs: raw_strikes.ban_secs,
+                trap_paths: raw_strikes.trap_paths,
+            }
+        }
+        None => StrikeRulesConfig::default(),
+    };
+
     Ok(SiteConfig {
         acme,
         hosts,
         tls_cert,
         tls_key,
         routes,
+        strikes,
     })
 }
 
