@@ -113,6 +113,8 @@ struct Site {
     /// The site's strike rules; `None` when the site leaves them
     /// disabled.
     strikes: Option<crate::strike::StrikeTracker>,
+    /// Normalized trap paths (a set, so the hot path is one lookup).
+    trap_paths: std::collections::HashSet<String>,
 }
 
 struct Route {
@@ -200,6 +202,7 @@ impl AppState {
                 routes,
                 redirect_https: config.server.https_listen.is_some(),
                 strikes,
+                trap_paths: site_config.strikes.trap_paths.iter().cloned().collect(),
             });
             for host in &site_config.hosts {
                 sites.insert(host.clone(), Arc::clone(&site));
@@ -256,8 +259,25 @@ impl AppState {
         peer: SocketAddr,
         request: Request<Incoming>,
     ) -> Result<Response<ResponseBody>, Infallible> {
-        // A globally banned client is dropped before any work.
-        if self.strikes_global.is_banned(peer.ip()) {
+        // A globally banned client is dropped before any work. Request-
+        // level bans key on the verified client IP — the same value rate
+        // limiting trusts — so a Cloudflare-fronted site bans the
+        // visitor, not the edge (the edge itself is exempt).
+        let client_ip = match verified_client_ip(
+            peer.ip().to_canonical(),
+            request.headers(),
+            &self.config.server.trusted_proxies,
+            &self.config.server.cloudflare_ranges,
+        ) {
+            Ok(ip) => ip,
+            Err(error) => {
+                // A malformed forwarding header is a malformed request.
+                self.strikes_global
+                    .strike(peer.ip(), crate::strike::StrikeReason::MalformedRequest);
+                return Ok(error.into_response());
+            }
+        };
+        if self.strikes_global.is_banned(client_ip) {
             return Ok(text_response(StatusCode::FORBIDDEN, "banned".to_string()));
         }
         let secure = request
@@ -277,7 +297,14 @@ impl AppState {
         let config = Arc::clone(&self.config);
         let strikes = self.strikes_global.clone();
         let mut response = match self
-            .handle_inner(peer, request, activity, upload_activity, upstream_wait)
+            .handle_inner(
+                peer,
+                client_ip,
+                request,
+                activity,
+                upload_activity,
+                upstream_wait,
+            )
             .await
         {
             Ok(response) => response,
@@ -285,10 +312,10 @@ impl AppState {
                 // The pre-site offences strike the server-wide tracker.
                 match error {
                     ProxyError::BadRequest => {
-                        strikes.strike(peer.ip(), crate::strike::StrikeReason::MalformedRequest);
+                        strikes.strike(client_ip, crate::strike::StrikeReason::MalformedRequest);
                     }
                     ProxyError::UnknownHost => {
-                        strikes.strike(peer.ip(), crate::strike::StrikeReason::UnknownHost);
+                        strikes.strike(client_ip, crate::strike::StrikeReason::UnknownHost);
                     }
                     _ => {}
                 }
@@ -304,6 +331,7 @@ impl AppState {
     async fn handle_inner(
         self: Arc<Self>,
         peer: SocketAddr,
+        client_ip: IpAddr,
         mut request: Request<Incoming>,
         activity: Option<ActivityGuard>,
         upload_activity: Option<ActivityGuard>,
@@ -345,17 +373,15 @@ impl AppState {
         }
         let site = self.sites.get(&host.name).ok_or(ProxyError::UnknownHost)?;
         if let Some(tracker) = &site.strikes
-            && tracker.is_banned(peer.ip())
+            && tracker.is_banned(client_ip)
         {
             return Err(ProxyError::Banned);
         }
         let path = normalize_path(request.uri().path()).map_err(|_| ProxyError::BadRequest)?;
         if let Some(tracker) = &site.strikes
-            && self.config.sites.iter().any(|sc| {
-                sc.hosts.contains(&host.name) && sc.strikes.trap_paths.iter().any(|t| *t == path)
-            })
+            && site.trap_paths.contains(&path)
         {
-            tracker.strike(peer.ip(), crate::strike::StrikeReason::TrapPath);
+            tracker.strike(client_ip, crate::strike::StrikeReason::TrapPath);
             return Err(ProxyError::NotFound);
         }
         if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/")
@@ -385,12 +411,6 @@ impl AppState {
             ));
         }
         let route = site.route(&path).ok_or(ProxyError::NotFound)?;
-        let client_ip = verified_client_ip(
-            peer.ip().to_canonical(),
-            request.headers(),
-            &self.config.server.trusted_proxies,
-            &self.config.server.cloudflare_ranges,
-        )?;
         let rate = route
             .config
             .requests_per_second

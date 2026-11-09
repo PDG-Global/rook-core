@@ -613,6 +613,7 @@ fn parse_site(
                     "must be non-zero; zero would silently disable bans",
                 ));
             }
+            let mut trap_paths = Vec::with_capacity(raw_strikes.trap_paths.len());
             for (i, path) in raw_strikes.trap_paths.iter().enumerate() {
                 if !path.starts_with('/') || path.contains('?') || path.contains('#') {
                     return Err(validation(
@@ -620,6 +621,15 @@ fn parse_site(
                         "must be an absolute path without query or fragment",
                     ));
                 }
+                // Normalized the same way request paths are, so a
+                // configured trap can always match.
+                let normalized = crate::path::normalize_path(path).map_err(|_| {
+                    validation(
+                        format!("{base}.trap_paths[{i}]"),
+                        "is not a normalizable path".to_string(),
+                    )
+                })?;
+                trap_paths.push(normalized);
             }
             StrikeRulesConfig {
                 enabled: raw_strikes.enabled,
@@ -627,7 +637,7 @@ fn parse_site(
                 threshold: raw_strikes.threshold,
                 window_secs: raw_strikes.window_secs,
                 ban_secs: raw_strikes.ban_secs,
-                trap_paths: raw_strikes.trap_paths,
+                trap_paths,
             }
         }
         None => StrikeRulesConfig::default(),
