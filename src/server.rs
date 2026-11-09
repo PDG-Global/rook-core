@@ -164,6 +164,7 @@ fn spawn_http_connection(
     let max_header_bytes = state.config.server.max_header_bytes;
     let header_read_timeout = state.config.server.header_read_timeout;
     let idle_timeout = state.config.server.idle_timeout;
+    let strikes = state.strikes_global();
     connections.spawn(async move {
         let _permit = permit;
         if !ready_for_http(&stream, header_read_timeout).await {
@@ -298,6 +299,7 @@ fn spawn_https_connection(
     let max_header_bytes = state.config.server.max_header_bytes;
     let header_read_timeout = state.config.server.header_read_timeout;
     let idle_timeout = state.config.server.idle_timeout;
+    let strikes = state.strikes_global();
     connections.spawn(async move {
         let _permit = permit;
         if !ready_for_http(&stream, header_read_timeout).await {
@@ -308,10 +310,15 @@ fn spawn_https_connection(
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
                 debug!(%peer, error = %error, "TLS handshake failed");
+                // A failed handshake on a direct connection strikes. A
+                // trusted-proxy peer is exempt (it cannot be attributed
+                // to a visitor), which the tracker enforces itself.
+                strikes.strike(peer.ip(), crate::strike::StrikeReason::FailedHandshake);
                 return;
             }
             Err(_) => {
                 debug!(%peer, "TLS handshake timed out");
+                strikes.strike(peer.ip(), crate::strike::StrikeReason::FailedHandshake);
                 return;
             }
         };

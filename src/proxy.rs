@@ -97,6 +97,9 @@ pub struct AppState {
     pub connections: ConnectionLimiter,
     pub acme_challenges: ChallengeStore,
     rates: RateLimiter,
+    /// Server-wide strikes: malformed requests, unknown hosts, failed
+    /// handshakes (pre-site offences).
+    strikes_global: crate::strike::StrikeTracker,
     upstreams: UpstreamLimiter,
     client_upstreams: ClientUpstreamLimiter,
     shutdown: broadcast::Sender<()>,
@@ -107,6 +110,9 @@ pub struct AppState {
 struct Site {
     routes: Vec<Route>,
     redirect_https: bool,
+    /// The site's strike rules; `None` when the site leaves them
+    /// disabled.
+    strikes: Option<crate::strike::StrikeTracker>,
 }
 
 struct Route {
@@ -153,6 +159,17 @@ impl AppState {
             .pool_max_idle_per_host(8)
             .build(connector);
 
+        // The exempt set is the operator allowlist plus the trusted
+        // proxies and Cloudflare ranges: a proxy in front of a site must
+        // never ban itself and take the site down.
+        let strike_exempt: Vec<ipnet::IpNet> = config
+            .server
+            .strike_allowlist
+            .iter()
+            .chain(config.server.trusted_proxies.iter())
+            .chain(config.server.cloudflare_ranges.iter())
+            .cloned()
+            .collect();
         let mut sites = HashMap::new();
         let mut route_id = 0;
         for site_config in &config.sites {
@@ -171,9 +188,18 @@ impl AppState {
                 })
                 .collect();
             routes.sort_by_key(|route| std::cmp::Reverse(route.config.prefix.len()));
+            let strikes = site_config.strikes.enabled.then(|| {
+                crate::strike::StrikeTracker::new(
+                    crate::strike::StrikeRules::from(&site_config.strikes),
+                    config.server.max_tracked_clients,
+                    std::time::Duration::from_secs(300),
+                    strike_exempt.clone(),
+                )
+            });
             let site = Arc::new(Site {
                 routes,
                 redirect_https: config.server.https_listen.is_some(),
+                strikes,
             });
             for host in &site_config.hosts {
                 sites.insert(host.clone(), Arc::clone(&site));
@@ -187,7 +213,14 @@ impl AppState {
             .flat_map(|site| &site.routes)
             .map(|route| route.upstreams.len())
             .sum();
+        let strikes_global = crate::strike::StrikeTracker::new(
+            crate::strike::StrikeRules::from(&config.server.strikes),
+            config.server.max_tracked_clients,
+            std::time::Duration::from_secs(300),
+            strike_exempt,
+        );
         Arc::new(Self {
+            strikes_global,
             connections: ConnectionLimiter::new(
                 config.server.max_connections,
                 config.server.max_connections_per_ip,
@@ -212,11 +245,21 @@ impl AppState {
         })
     }
 
+    /// The server-wide strike tracker (failed handshakes strike from the
+    /// accept path in `server`).
+    pub fn strikes_global(&self) -> crate::strike::StrikeTracker {
+        self.strikes_global.clone()
+    }
+
     pub async fn handle(
         self: Arc<Self>,
         peer: SocketAddr,
         request: Request<Incoming>,
     ) -> Result<Response<ResponseBody>, Infallible> {
+        // A globally banned client is dropped before any work.
+        if self.strikes_global.is_banned(peer.ip()) {
+            return Ok(text_response(StatusCode::FORBIDDEN, "banned".to_string()));
+        }
         let secure = request
             .extensions()
             .get::<RequestScheme>()
@@ -232,12 +275,25 @@ impl AppState {
             .as_ref()
             .map(|activity| activity.begin_upstream_wait());
         let config = Arc::clone(&self.config);
+        let strikes = self.strikes_global.clone();
         let mut response = match self
             .handle_inner(peer, request, activity, upload_activity, upstream_wait)
             .await
         {
             Ok(response) => response,
-            Err(error) => error.into_response(),
+            Err(error) => {
+                // The pre-site offences strike the server-wide tracker.
+                match error {
+                    ProxyError::BadRequest => {
+                        strikes.strike(peer.ip(), crate::strike::StrikeReason::MalformedRequest);
+                    }
+                    ProxyError::UnknownHost => {
+                        strikes.strike(peer.ip(), crate::strike::StrikeReason::UnknownHost);
+                    }
+                    _ => {}
+                }
+                error.into_response()
+            }
         };
         if secure {
             apply_hsts(&mut response, &config);
@@ -288,7 +344,20 @@ impl AppState {
             return Err(ProxyError::MisdirectedRequest);
         }
         let site = self.sites.get(&host.name).ok_or(ProxyError::UnknownHost)?;
+        if let Some(tracker) = &site.strikes
+            && tracker.is_banned(peer.ip())
+        {
+            return Err(ProxyError::Banned);
+        }
         let path = normalize_path(request.uri().path()).map_err(|_| ProxyError::BadRequest)?;
+        if let Some(tracker) = &site.strikes
+            && self.config.sites.iter().any(|sc| {
+                sc.hosts.contains(&host.name) && sc.strikes.trap_paths.iter().any(|t| *t == path)
+            })
+        {
+            tracker.strike(peer.ip(), crate::strike::StrikeReason::TrapPath);
+            return Err(ProxyError::NotFound);
+        }
         if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/")
             && !token.is_empty()
             && !token.contains('/')
@@ -587,6 +656,8 @@ enum ProxyError {
     BadRequest,
     MisdirectedRequest,
     UnknownHost,
+    /// The client is banned at this site.
+    Banned,
     NotFound,
     Forbidden,
     RateLimited,
@@ -602,6 +673,7 @@ impl ProxyError {
             Self::BadRequest => StatusCode::BAD_REQUEST,
             Self::MisdirectedRequest => StatusCode::MISDIRECTED_REQUEST,
             Self::UnknownHost | Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Banned => StatusCode::FORBIDDEN,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
