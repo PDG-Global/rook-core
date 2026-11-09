@@ -553,6 +553,18 @@ fn parse_site(
                     "must be at least 1",
                 ));
             }
+            if raw_strikes.window_secs == 0 {
+                return Err(validation(
+                    format!("{base}.window_secs"),
+                    "must be non-zero; zero would silently disable counting",
+                ));
+            }
+            if raw_strikes.ban_secs == 0 {
+                return Err(validation(
+                    format!("{base}.ban_secs"),
+                    "must be non-zero; zero would silently disable bans",
+                ));
+            }
             for (i, path) in raw_strikes.trap_paths.iter().enumerate() {
                 if !path.starts_with('/') || path.contains('?') || path.contains('#') {
                     return Err(validation(

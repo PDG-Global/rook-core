@@ -39,6 +39,7 @@ fn log_only_counts_but_never_bans() {
 #[test]
 fn enforcing_bans_at_the_threshold_and_the_ban_expires() {
     let t = tracker(StrikeRules {
+        enabled: true,
         log_only: false,
         threshold: 3,
         window: Duration::from_secs(600),
@@ -72,6 +73,7 @@ fn enforcing_bans_at_the_threshold_and_the_ban_expires() {
 #[test]
 fn strikes_older_than_the_window_do_not_count() {
     let t = tracker(StrikeRules {
+        enabled: true,
         log_only: false,
         threshold: 2,
         window: Duration::from_millis(100),
@@ -96,6 +98,7 @@ fn exempt_ranges_are_never_struck_or_banned() {
     let exempt: Vec<ipnet::IpNet> = vec!["203.0.113.0/24".parse().unwrap()];
     let t = StrikeTracker::new(
         StrikeRules {
+            enabled: true,
             log_only: false,
             threshold: 1,
             ..StrikeRules::default()
@@ -114,6 +117,7 @@ fn exempt_ranges_are_never_struck_or_banned() {
 #[test]
 fn a_full_table_evicts_the_oldest_idle_entry_instead_of_growing() {
     let t = tracker(StrikeRules {
+        enabled: true,
         log_only: false,
         threshold: 2,
         ..StrikeRules::default()
@@ -177,4 +181,38 @@ upstreams = ["http://127.0.0.1:9000"]
 "#,
     );
     assert!(bad.is_err());
+}
+
+#[test]
+fn disabled_rules_are_inert() {
+    let t = tracker(StrikeRules {
+        enabled: false,
+        log_only: false,
+        threshold: 1,
+        ..StrikeRules::default()
+    });
+    assert_eq!(
+        t.strike(ip(1), StrikeReason::MalformedRequest),
+        StrikeOutcome::Noted
+    );
+    assert!(!t.is_banned(ip(1)));
+    let (_, bans, would_ban, _) = t.metrics();
+    assert_eq!(bans + would_ban, 0);
+}
+
+#[test]
+fn the_strike_vec_never_outgrows_the_threshold() {
+    // In log-only mode (the default), thousands of strikes from one
+    // client stay a bounded counter, not an unbounded vec.
+    let t = tracker(StrikeRules {
+        log_only: true,
+        threshold: 3,
+        ..StrikeRules::default()
+    });
+    for _ in 0..10_000 {
+        t.strike(ip(1), StrikeReason::MalformedRequest);
+    }
+    let (strikes, _, would_ban, _) = t.metrics();
+    assert_eq!(strikes.get("malformed-request"), Some(&10_000));
+    assert!(would_ban > 0);
 }

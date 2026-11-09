@@ -5,7 +5,10 @@
 //! hosts, failed TLS handshakes (direct connections only — behind
 //! Cloudflare a failed handshake cannot be attributed to a visitor) and
 //! configured trap paths. Past the threshold the client is banned for a
-//! bounded time.
+//! bounded time. (Trap-path and reason wiring into the request path
+//! lands with the server integration commit; this module is the tracker.)
+//! Failed-handshake strikes apply only to direct connections: behind a
+//! trusted proxy a failed handshake cannot be attributed to a visitor.
 //!
 //! Everything about a rule is safe by default:
 //!
@@ -62,6 +65,10 @@ impl StrikeReason {
 /// One site's strike rules.
 #[derive(Clone, Debug)]
 pub struct StrikeRules {
+    /// Whether the tracker acts at all. Carried here, not left to the
+    /// call site: a parsed switch that silently does nothing looks wired
+    /// for months. A disabled set neither strikes nor bans.
+    pub enabled: bool,
     /// Log and count only; nothing is rejected.
     pub log_only: bool,
     /// Strikes within `window` that trigger a ban.
@@ -77,6 +84,7 @@ pub struct StrikeRules {
 impl Default for StrikeRules {
     fn default() -> Self {
         Self {
+            enabled: true,
             log_only: true,
             threshold: 10,
             window: Duration::from_secs(600),
@@ -121,8 +129,9 @@ struct Inner {
     rules: StrikeRules,
     max_tracked: usize,
     idle_expiry: Duration,
-    /// Never struck, never banned (operator allowlist plus the trusted
-    /// Cloudflare ranges).
+    /// Never struck, never banned. The caller builds this from the
+    /// operator allowlist **plus the trusted-proxy ranges** — a proxy in
+    /// front of a site must never ban itself and take the site down.
     exempt: Vec<IpNet>,
     state: Mutex<State>,
     metrics: Mutex<StrikeMetrics>,
@@ -144,6 +153,7 @@ pub enum StrikeOutcome {
 impl From<&crate::config::StrikeRulesConfig> for StrikeRules {
     fn from(c: &crate::config::StrikeRulesConfig) -> Self {
         Self {
+            enabled: c.enabled,
             log_only: c.log_only,
             threshold: c.threshold,
             window: Duration::from_secs(c.window_secs),
@@ -180,7 +190,7 @@ impl StrikeTracker {
     /// each request; a banned client's request is dropped with the ban
     /// logged and counted.
     pub fn is_banned(&self, ip: IpAddr) -> bool {
-        if self.is_exempt(&ip) {
+        if !self.inner.rules.enabled || self.is_exempt(&ip) {
             return false;
         }
         let now = Instant::now();
@@ -207,7 +217,7 @@ impl StrikeTracker {
 
     /// Records a strike. Returns what it did.
     pub fn strike(&self, ip: IpAddr, reason: StrikeReason) -> StrikeOutcome {
-        if self.is_exempt(&ip) {
+        if !self.inner.rules.enabled || self.is_exempt(&ip) {
             return StrikeOutcome::Noted;
         }
         *lock_recover(&self.inner.metrics)
@@ -217,13 +227,16 @@ impl StrikeTracker {
         let now = Instant::now();
         let rules = &self.inner.rules;
         let mut st = lock_recover(&self.inner.state);
-        // Fixed memory: expire idle entries, then evict the oldest-idle
-        // if the table is still full.
-        st.clients.retain(|_, c| {
-            now.duration_since(c.last_seen) < self.inner.idle_expiry
-                || c.banned_until.is_some_and(|u| u > now)
-        });
+        // Per-client expiry happens on access below; a whole-map sweep
+        // runs only when a new client meets a full table, so a hot path
+        // the attacker controls stays O(1) per strike.
         let key = ClientKey::from(ip);
+        if !st.clients.contains_key(&key) && st.clients.len() >= self.inner.max_tracked {
+            st.clients.retain(|_, c| {
+                now.duration_since(c.last_seen) < self.inner.idle_expiry
+                    || c.banned_until.is_some_and(|u| u > now)
+            });
+        }
         if !st.clients.contains_key(&key) && st.clients.len() >= self.inner.max_tracked {
             if let Some(oldest) = st
                 .clients
@@ -249,7 +262,12 @@ impl StrikeTracker {
         }
         c.strikes
             .retain(|(at, _)| now.duration_since(*at) < rules.window);
-        c.strikes.push((now, reason));
+        // Only the count matters, so the vec never grows past the
+        // threshold: in log-only mode nothing else bounds it, and an
+        // attacker must not turn the defence into memory exhaustion.
+        if c.strikes.len() < rules.threshold as usize {
+            c.strikes.push((now, reason));
+        }
         if (c.strikes.len() as u32) < rules.threshold {
             return StrikeOutcome::Noted;
         }
