@@ -163,6 +163,47 @@ upstreams = ["http://127.0.0.1:9000"]
     assert_eq!(rules.threshold, 5);
     assert_eq!(rules.trap_paths, vec!["/wp-admin", "/.git"]);
 
+    // Trap paths are normalized at load with the same function request
+    // paths use: "/admin/" stays "/admin/" (as it does on the wire), and
+    // what request normalization rejects ("//wp-admin" has an ambiguous
+    // repeated separator) is rejected in config too, so a trap can never
+    // be accepted-but-unmatchable.
+    let normalized = rookd::config::Config::parse(
+        r#"
+[server]
+listen = "127.0.0.1:8080"
+https_listen = "127.0.0.1:8443"
+[[sites]]
+hosts = ["example.com"]
+tls_cert = "cert.pem"
+tls_key = "key.pem"
+[sites.strikes]
+trap_paths = ["/admin/"]
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:9000"]
+"#,
+    )
+    .unwrap();
+    assert_eq!(normalized.sites[0].strikes.trap_paths, vec!["/admin/"]);
+    let ambiguous = rookd::config::Config::parse(
+        r#"
+[server]
+listen = "127.0.0.1:8080"
+https_listen = "127.0.0.1:8443"
+[[sites]]
+hosts = ["example.com"]
+tls_cert = "cert.pem"
+tls_key = "key.pem"
+[sites.strikes]
+trap_paths = ["//wp-admin"]
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:9000"]
+"#,
+    );
+    assert!(ambiguous.is_err());
+
     // A trap path that is not an absolute path is rejected.
     let bad = rookd::config::Config::parse(
         r#"
