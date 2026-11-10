@@ -51,8 +51,67 @@ use crate::{
 
 type RequestBody = Pin<Box<dyn Body<Data = Bytes, Error = BoxError> + Send + 'static>>;
 pub type ResponseBody = BoxBody<Bytes, BoxError>;
-type ProxyClient = Client<HttpConnector, RequestBody>;
+type ProxyClient = Client<GuardedConnector, RequestBody>;
 type ProxyResult = Result<Response<ResponseBody>, ProxyError>;
+
+/// An HTTP connector that refuses to dial the metrics listener.
+///
+/// Thomas's guard: loopback isn't private on a reverse proxy — a route
+/// whose upstream resolves to the metrics listener's address would
+/// publish `/metrics` through the proxy even though the listener only
+/// binds loopback. IP-literal upstreams are rejected at config load
+/// (`config::reject_metrics_upstream`); this is the connect-time half
+/// for names that resolve to the listener later, and for the WebSocket
+/// dial path, which checks the same `blocked` address after
+/// `TcpStream::connect`. `None` disables the check (metrics off).
+#[derive(Clone)]
+pub struct GuardedConnector {
+    inner: HttpConnector,
+    blocked: Option<SocketAddr>,
+}
+
+impl GuardedConnector {
+    /// Is this resolved address the metrics listener?
+    fn is_blocked(blocked: Option<SocketAddr>, peer: SocketAddr) -> bool {
+        blocked.is_some_and(|blocked| {
+            blocked.port() == peer.port() && blocked.ip() == peer.ip().to_canonical()
+        })
+    }
+
+    fn refused() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "upstream resolved to the metrics listener; refusing to proxy to it",
+        )
+    }
+}
+
+impl tower_service::Service<Uri> for GuardedConnector {
+    type Response = TokioIo<TcpStream>;
+    type Error = BoxError;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let blocked = self.blocked;
+        let connect = self.inner.call(uri);
+        Box::pin(async move {
+            let stream = connect.await?;
+            let peer = stream.inner().peer_addr()?;
+            if Self::is_blocked(blocked, peer) {
+                return Err(Self::refused().into());
+            }
+            Ok(stream)
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct ConnectionLease(pub Arc<ConnectionPermit>);
@@ -92,6 +151,7 @@ const WEBSOCKET_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub struct AppState {
     pub config: Arc<Config>,
+    pub metrics: crate::metrics::Metrics,
     sites: HashMap<String, Arc<Site>>,
     client: ProxyClient,
     pub connections: ConnectionLimiter,
@@ -155,6 +215,12 @@ impl AppState {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(config.server.upstream_connect_timeout));
         connector.enforce_http(true);
+        let metrics = crate::metrics::Metrics::default();
+        let blocked = config.metrics.enabled.then_some(config.metrics.listen);
+        let connector = GuardedConnector {
+            inner: connector,
+            blocked,
+        };
         let client = Client::builder(TokioExecutor::new())
             .http1_max_buf_size(config.server.max_header_bytes)
             .http1_max_headers(100)
@@ -191,12 +257,19 @@ impl AppState {
                 .collect();
             routes.sort_by_key(|route| std::cmp::Reverse(route.config.prefix.len()));
             let strikes = site_config.strikes.enabled.then(|| {
-                crate::strike::StrikeTracker::new(
+                let tracker = crate::strike::StrikeTracker::new(
                     crate::strike::StrikeRules::from(&site_config.strikes),
                     config.server.max_tracked_clients,
                     std::time::Duration::from_secs(300),
                     strike_exempt.clone(),
-                )
+                );
+                // The scope label is the site's first configured host:
+                // operator-supplied, bounded by the configuration, and
+                // never request-derived.
+                if let Some(host) = site_config.hosts.first() {
+                    metrics.register_strikes(host.clone(), tracker.clone());
+                }
+                tracker
             });
             let site = Arc::new(Site {
                 routes,
@@ -222,6 +295,7 @@ impl AppState {
             std::time::Duration::from_secs(300),
             strike_exempt,
         );
+        metrics.register_strikes("global".to_owned(), strikes_global.clone());
         Arc::new(Self {
             strikes_global,
             connections: ConnectionLimiter::new(
@@ -245,7 +319,13 @@ impl AppState {
             config: Arc::new(config),
             sites,
             client,
+            metrics,
         })
+    }
+
+    /// Open WebSocket tunnels, for the metrics endpoint.
+    pub fn active_tunnels(&self) -> usize {
+        self.active_tunnels.load(Ordering::Relaxed)
     }
 
     /// The server-wide strike tracker (failed handshakes strike from the
@@ -259,6 +339,7 @@ impl AppState {
         peer: SocketAddr,
         request: Request<Incoming>,
     ) -> Result<Response<ResponseBody>, Infallible> {
+        self.metrics.request();
         // A globally banned client is dropped before any work. Request-
         // level bans key on the verified client IP — the same value rate
         // limiting trusts — so a Cloudflare-fronted site bans the
@@ -274,11 +355,15 @@ impl AppState {
                 // A malformed forwarding header is a malformed request.
                 self.strikes_global
                     .strike(peer.ip(), crate::strike::StrikeReason::MalformedRequest);
-                return Ok(error.into_response());
+                let response = error.into_response();
+                self.metrics.response(response.status().as_u16());
+                return Ok(response);
             }
         };
         if self.strikes_global.is_banned(client_ip) {
-            return Ok(text_response(StatusCode::FORBIDDEN, "banned".to_string()));
+            let response = text_response(StatusCode::FORBIDDEN, "banned".to_string());
+            self.metrics.response(response.status().as_u16());
+            return Ok(response);
         }
         let secure = request
             .extensions()
@@ -296,7 +381,7 @@ impl AppState {
             .map(|activity| activity.begin_upstream_wait());
         let config = Arc::clone(&self.config);
         let strikes = self.strikes_global.clone();
-        let mut response = match self
+        let mut response = match Arc::clone(&self)
             .handle_inner(
                 peer,
                 client_ip,
@@ -317,11 +402,17 @@ impl AppState {
                     ProxyError::UnknownHost => {
                         strikes.strike(client_ip, crate::strike::StrikeReason::UnknownHost);
                     }
+                    ProxyError::BadGateway
+                    | ProxyError::UpstreamUnavailable
+                    | ProxyError::Timeout => {
+                        self.metrics.upstream_failed();
+                    }
                     _ => {}
                 }
                 error.into_response()
             }
         };
+        self.metrics.response(response.status().as_u16());
         if secure {
             apply_hsts(&mut response, &config);
         }
@@ -550,6 +641,20 @@ impl AppState {
         .await
         .map_err(|_| ProxyError::Timeout)?
         .map_err(|_| ProxyError::BadGateway)?;
+        // Tunnels carry no forwarding headers, so the metrics handler's
+        // header guard can never fire for them: the connect-time check
+        // is the only thing between a tunnel and the metrics listener.
+        let blocked = self
+            .config
+            .metrics
+            .enabled
+            .then_some(self.config.metrics.listen);
+        if let Ok(peer) = stream.peer_addr()
+            && GuardedConnector::is_blocked(blocked, peer)
+        {
+            debug!(%peer, "WebSocket upstream resolved to the metrics listener; refusing");
+            return Err(ProxyError::BadGateway);
+        }
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|_| ProxyError::BadGateway)?;

@@ -1,7 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use hyper::{StatusCode, server::conn::http1, service::service_fn};
+use bytes::Bytes;
+use http::{HeaderName, Method, Request, Response, header::CONTENT_TYPE};
+use http_body_util::{BodyExt, Full};
+use hyper::{StatusCode, body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as AutoBuilder,
@@ -51,6 +54,9 @@ pub async fn run(config: Config) -> Result<()> {
 
     let mut servers = JoinSet::new();
     servers.spawn(run_http(Arc::clone(&state)));
+    if config.metrics.enabled {
+        servers.spawn(run_metrics(Arc::clone(&state)));
+    }
     if config.server.blocklist_file.is_some() {
         servers.spawn(run_trust_reload(Arc::clone(&state), Arc::clone(&trust)));
     }
@@ -105,6 +111,97 @@ async fn run_trust_reload(
     }
 }
 
+/// The loopback-only operational metrics endpoint (plan §8). The
+/// configuration guarantees `listen` is loopback; the proxy can never
+/// reach this listener (`proxy::GuardedConnector`), and the handler
+/// refuses anything that looks proxied (see `metrics_response`).
+async fn run_metrics(state: Arc<AppState>) -> Result<()> {
+    let listen = state.config.metrics.listen;
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("could not bind metrics listener {listen}"))?;
+    info!(%listen, "Rook metrics is listening (loopback only)");
+
+    let mut shutdown = state.subscribe_shutdown();
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            accepted = listener.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        debug!(error = %error, "metrics accept failed; continuing");
+                        continue;
+                    }
+                };
+                connections.spawn(serve_metrics_connection(stream, Arc::clone(&state)));
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(error = %error, "metrics connection task failed");
+                }
+            }
+        }
+    }
+    // Scrape connections are operator tooling; on shutdown they are
+    // simply cut rather than drained.
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+async fn serve_metrics_connection(stream: TcpStream, state: Arc<AppState>) {
+    let service = service_fn(move |request: Request<Incoming>| {
+        let state = Arc::clone(&state);
+        async move { Ok::<_, Infallible>(metrics_response(&state, &request)) }
+    });
+    let mut builder = http1::Builder::new();
+    builder
+        .max_buf_size(8192)
+        .max_headers(32)
+        .header_read_timeout(Duration::from_secs(5))
+        .timer(TokioTimer::new());
+    if let Err(error) = builder
+        .serve_connection(TokioIo::new(stream), service)
+        .await
+    {
+        debug!(error = %error, "metrics connection ended");
+    }
+}
+
+fn metrics_response(
+    state: &AppState,
+    request: &Request<Incoming>,
+) -> Response<crate::proxy::ResponseBody> {
+    // Thomas's guard: a direct scrape never carries forwarding headers,
+    // so their presence means the request arrived through a proxy —
+    // possibly this one, if the connect-time guard ever has a gap.
+    let proxied = request.headers().contains_key(http::header::FORWARDED)
+        || request
+            .headers()
+            .keys()
+            .any(|name: &HeaderName| name.as_str().starts_with("x-forwarded-"));
+    if proxied {
+        return crate::proxy::empty_response(StatusCode::FORBIDDEN);
+    }
+    if request.method() != Method::GET {
+        return crate::proxy::empty_response(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    if request.uri().path() != "/metrics" {
+        return crate::proxy::empty_response(StatusCode::NOT_FOUND);
+    }
+    let body = state.metrics.render(state.active_tunnels());
+    Response::builder()
+        .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("static response is valid")
+}
+
 async fn run_http(state: Arc<AppState>) -> Result<()> {
     let listener = TcpListener::bind(state.config.server.listen)
         .await
@@ -131,11 +228,13 @@ async fn run_http(state: Arc<AppState>) -> Result<()> {
                     }
                 };
                 let peer = canonical_peer(peer);
+                let gauge = state.metrics.connection_accepted(crate::metrics::Listener::Http);
                 let Some(permit) = state.connections.acquire(peer.ip()) else {
                     debug!(%peer, "Connection rejected by limit");
+                    state.metrics.connection_rejected(crate::metrics::Listener::Http);
                     continue;
                 };
-                spawn_http_connection(&mut connections, &state, stream, peer, permit);
+                spawn_http_connection(&mut connections, &state, stream, peer, permit, gauge);
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = completed {
@@ -156,6 +255,7 @@ fn spawn_http_connection(
     stream: TcpStream,
     peer: std::net::SocketAddr,
     permit: crate::limit::ConnectionPermit,
+    gauge: crate::metrics::ConnectionGauge,
 ) {
     let permit = Arc::new(permit);
     let service_permit = Arc::clone(&permit);
@@ -167,6 +267,7 @@ fn spawn_http_connection(
     let strikes = state.strikes_global();
     connections.spawn(async move {
         let _permit = permit;
+        let _gauge = gauge;
         if !ready_for_http(&stream, header_read_timeout).await {
             debug!(%peer, "Connection closed before sending a complete first byte");
             return;
@@ -258,8 +359,14 @@ async fn run_https(
                     }
                 };
                 let peer = canonical_peer(peer);
+                let gauge = state
+                    .metrics
+                    .connection_accepted(crate::metrics::Listener::Https);
                 let Some(permit) = state.connections.acquire(peer.ip()) else {
                     debug!(%peer, "Connection rejected by limit");
+                    state
+                        .metrics
+                        .connection_rejected(crate::metrics::Listener::Https);
                     continue;
                 };
                 spawn_https_connection(
@@ -269,6 +376,7 @@ async fn run_https(
                     stream,
                     peer,
                     permit,
+                    gauge,
                 );
             }
             completed = connections.join_next(), if !connections.is_empty() => {
@@ -291,6 +399,7 @@ fn spawn_https_connection(
     stream: TcpStream,
     peer: std::net::SocketAddr,
     permit: crate::limit::ConnectionPermit,
+    gauge: crate::metrics::ConnectionGauge,
 ) {
     let permit = Arc::new(permit);
     let service_permit = Arc::clone(&permit);
@@ -302,6 +411,7 @@ fn spawn_https_connection(
     let strikes = state.strikes_global();
     connections.spawn(async move {
         let _permit = permit;
+        let _gauge = gauge;
         if !ready_for_http(&stream, header_read_timeout).await {
             debug!(%peer, "HTTPS connection closed before its first byte");
             return;
@@ -310,6 +420,7 @@ fn spawn_https_connection(
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
                 debug!(%peer, error = %error, "TLS handshake failed");
+                connection_state.metrics.tls_handshake_failed();
                 // A failed handshake on a direct connection strikes. A
                 // trusted-proxy peer is exempt (it cannot be attributed
                 // to a visitor), which the tracker enforces itself.
@@ -318,6 +429,7 @@ fn spawn_https_connection(
             }
             Err(_) => {
                 debug!(%peer, "TLS handshake timed out");
+                connection_state.metrics.tls_handshake_failed();
                 strikes.strike(peer.ip(), crate::strike::StrikeReason::FailedHandshake);
                 return;
             }
