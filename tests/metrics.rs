@@ -275,6 +275,60 @@ async fn scrapes_carrying_forwarding_headers_are_refused() {
 }
 
 #[tokio::test]
+async fn the_metrics_listener_caps_concurrent_connections() {
+    // Harry's finding: loopback limits who can scrape, not how many.
+    // Hold every slot, then prove the next connection is refused and
+    // that a freed slot serves again.
+    let upstream = spawn_upstream().await;
+    let addr = free_addr().await;
+    let metrics = free_addr().await;
+    let rook = spawn_rook(
+        rook_config(addr, metrics, &format!("http://{upstream}")),
+        addr,
+        metrics,
+    )
+    .await;
+
+    let mut held = Vec::new();
+    for _ in 0..rookd::server::MAX_METRICS_CONNECTIONS {
+        held.push(TcpStream::connect(rook.metrics).await.unwrap());
+    }
+    // Let the accept loop account the held set before probing.
+    sleep(Duration::from_millis(50)).await;
+
+    let mut extra = TcpStream::connect(rook.metrics).await.unwrap();
+    extra
+        .write_all(b"GET /metrics HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut body = Vec::new();
+    // A refused connection is dropped with our request still unread in
+    // its receive buffer, which surfaces as EOF-with-no-data or as a
+    // reset; a timeout would mean it was served (held open).
+    let refused = match timeout(IO_TIMEOUT, extra.read_to_end(&mut body)).await {
+        Ok(Ok(_)) => body.is_empty(),
+        Ok(Err(error)) => error.kind() == std::io::ErrorKind::ConnectionReset,
+        Err(_) => false,
+    };
+    assert!(refused, "over-cap connection was served: {body:?}");
+
+    // A freed slot serves again.
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Ok(stream) = TcpStream::connect(rook.metrics).await {
+            drop(stream);
+            let (status, _, _) = get(rook.metrics, "localhost", "/metrics").await;
+            if status == 200 {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "listener never served again");
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
 async fn the_proxy_cannot_dial_the_metrics_listener() {
     // The config-load check covers IP-literal upstreams; a hostname that
     // resolves to the listener later (here: localhost, on the metrics

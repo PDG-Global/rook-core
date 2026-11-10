@@ -115,6 +115,14 @@ async fn run_trust_reload(
 /// configuration guarantees `listen` is loopback; the proxy can never
 /// reach this listener (`proxy::GuardedConnector`), and the handler
 /// refuses anything that looks proxied (see `metrics_response`).
+///
+/// Loopback limits *who* can scrape, not *how many*: anything local
+/// (a co-tenant, a compromised service) could otherwise hold
+/// connections open until the task set grows without limit, on the
+/// proxy. So the listener takes a small fixed cap and refuses beyond
+/// it (Harry, review of PR #7).
+pub const MAX_METRICS_CONNECTIONS: usize = 16;
+
 async fn run_metrics(state: Arc<AppState>) -> Result<()> {
     let listen = state.config.metrics.listen;
     let listener = TcpListener::bind(listen)
@@ -123,6 +131,7 @@ async fn run_metrics(state: Arc<AppState>) -> Result<()> {
     info!(%listen, "Rook metrics is listening (loopback only)");
 
     let mut shutdown = state.subscribe_shutdown();
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -135,7 +144,19 @@ async fn run_metrics(state: Arc<AppState>) -> Result<()> {
                         continue;
                     }
                 };
-                connections.spawn(serve_metrics_connection(stream, Arc::clone(&state)));
+                let opened = active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if opened >= MAX_METRICS_CONNECTIONS {
+                    active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    debug!("metrics connection refused; at the connection cap");
+                    continue;
+                }
+                let active = Arc::clone(&active);
+                let state = Arc::clone(&state);
+                connections.spawn(async move {
+                    // Balances the slot on every exit path.
+                    let _slot = DecrementOnDrop(active);
+                    serve_metrics_connection(stream, state).await;
+                });
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = completed {
@@ -149,6 +170,14 @@ async fn run_metrics(state: Arc<AppState>) -> Result<()> {
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     Ok(())
+}
+
+struct DecrementOnDrop(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for DecrementOnDrop {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 async fn serve_metrics_connection(stream: TcpStream, state: Arc<AppState>) {

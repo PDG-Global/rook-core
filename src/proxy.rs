@@ -33,7 +33,7 @@ use tokio::{
     sync::{Notify, broadcast},
     time::timeout,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     acme::ChallengeStore,
@@ -644,16 +644,28 @@ impl AppState {
         // Tunnels carry no forwarding headers, so the metrics handler's
         // header guard can never fire for them: the connect-time check
         // is the only thing between a tunnel and the metrics listener.
+        // It must fail CLOSED — an unnamed peer on an established socket
+        // is anomalous (Thomas, review of PR #7), so an error refuses
+        // the tunnel and is recorded, not silently passed. No test can
+        // reach the error arm through the public path: a connected
+        // socket's peer_addr does not fail on demand.
         let blocked = self
             .config
             .metrics
             .enabled
             .then_some(self.config.metrics.listen);
-        if let Ok(peer) = stream.peer_addr()
-            && GuardedConnector::is_blocked(blocked, peer)
-        {
-            debug!(%peer, "WebSocket upstream resolved to the metrics listener; refusing");
-            return Err(ProxyError::BadGateway);
+        match stream.peer_addr() {
+            Ok(peer) if GuardedConnector::is_blocked(blocked, peer) => {
+                debug!(%peer, "WebSocket upstream resolved to the metrics listener; refusing");
+                self.metrics.upstream_failed();
+                return Err(ProxyError::BadGateway);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "WebSocket upstream has no peer address; refusing the tunnel");
+                self.metrics.upstream_failed();
+                return Err(ProxyError::BadGateway);
+            }
         }
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await

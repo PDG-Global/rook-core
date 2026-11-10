@@ -393,19 +393,7 @@ fn reject_metrics_upstream(
     for (site_index, site) in sites.iter().enumerate() {
         for (route_index, route) in site.routes.iter().enumerate() {
             for (upstream_index, upstream) in route.upstreams.iter().enumerate() {
-                let Some(host) = upstream.host() else {
-                    continue;
-                };
-                // Uri::host() keeps the brackets on IPv6 literals.
-                let unbracketed = host
-                    .strip_prefix('[')
-                    .and_then(|host| host.strip_suffix(']'))
-                    .unwrap_or(host);
-                let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() else {
-                    continue;
-                };
-                let port = upstream.port_u16().unwrap_or(80);
-                if ip.to_canonical() == metrics.listen.ip() && port == metrics.listen.port() {
+                if upstream_matches_listener(upstream, metrics.listen) {
                     return Err(validation(
                         format!(
                             "sites[{site_index}].routes[{route_index}].upstreams[{upstream_index}]"
@@ -417,6 +405,32 @@ fn reject_metrics_upstream(
         }
     }
     Ok(())
+}
+
+/// Does this upstream URL address the metrics listener exactly? Only
+/// IP literals answer here; names that resolve to the listener later
+/// are refused at connect time (`proxy::GuardedConnector`). The port
+/// defaults by scheme (Harry, review of PR #7: `https:` with no port
+/// means 443 at connect time, so the two guards must agree).
+fn upstream_matches_listener(upstream: &Uri, listen: SocketAddr) -> bool {
+    let Some(host) = upstream.host() else {
+        return false;
+    };
+    // Uri::host() keeps the brackets on IPv6 literals.
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let default_port = if upstream.scheme_str() == Some("https") {
+        443
+    } else {
+        80
+    };
+    let port = upstream.port_u16().unwrap_or(default_port);
+    ip.to_canonical() == listen.ip() && port == listen.port()
 }
 
 fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
@@ -1670,6 +1684,44 @@ upstreams = ["http://127.0.0.1"]
             minimal_config()
         );
         assert!(Config::parse(&input).is_err());
+    }
+
+    #[test]
+    fn metrics_upstream_match_defaults_the_port_by_scheme() {
+        // Harry's review point: the load-time guard must default the
+        // port the way the connector does, or an https upstream with no
+        // port would slip past it onto a listener on 443.
+        let listen_443: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let listen_80: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        assert!(upstream_matches_listener(
+            &"https://127.0.0.1".parse().unwrap(),
+            listen_443
+        ));
+        assert!(!upstream_matches_listener(
+            &"http://127.0.0.1".parse().unwrap(),
+            listen_443
+        ));
+        assert!(upstream_matches_listener(
+            &"http://127.0.0.1".parse().unwrap(),
+            listen_80
+        ));
+        assert!(upstream_matches_listener(
+            &"https://127.0.0.1:443".parse().unwrap(),
+            listen_443
+        ));
+        assert!(!upstream_matches_listener(
+            &"https://127.0.0.1:444".parse().unwrap(),
+            listen_443
+        ));
+        assert!(!upstream_matches_listener(
+            &"https://127.0.0.2".parse().unwrap(),
+            listen_443
+        ));
+        // Names never answer here; the connect-time guard owns them.
+        assert!(!upstream_matches_listener(
+            &"http://localhost:80".parse().unwrap(),
+            listen_80
+        ));
     }
 
     #[test]
