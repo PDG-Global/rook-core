@@ -611,10 +611,12 @@ impl AppState {
             self.config.server.idle_timeout,
             self.client.request(request),
         )
-        .await?
-        .map_err(upstream_request_error)?;
+        .await;
+        // Success or failure, the observation lands in the histogram:
+        // a success-only latency flatters a degrading upstream.
         self.metrics
             .upstream_latency(crate::metrics::UpstreamKind::Http, started.elapsed());
+        let response = response?.map_err(upstream_request_error)?;
         Ok(map_response(
             response,
             self.config.server.idle_timeout,
@@ -637,13 +639,26 @@ impl AppState {
         } = upgrade;
         let _upstream_wait = upstream_wait;
         let authority = base.authority().ok_or(ProxyError::BadGateway)?.clone();
-        let stream = timeout(
+        let started = std::time::Instant::now();
+        let stream = match timeout(
             self.config.server.upstream_connect_timeout,
             TcpStream::connect(authority.as_str()),
         )
         .await
-        .map_err(|_| ProxyError::Timeout)?
-        .map_err(|_| ProxyError::BadGateway)?;
+        {
+            Ok(Ok(stream)) => stream,
+            result => {
+                // Connect failures land in the latency histogram too —
+                // a success-only distribution flatters a degrading
+                // upstream (Harry, review of PR #8).
+                self.metrics
+                    .upstream_latency(crate::metrics::UpstreamKind::WebSocket, started.elapsed());
+                return match result {
+                    Ok(Err(_)) => Err(ProxyError::BadGateway),
+                    _ => Err(ProxyError::Timeout),
+                };
+            }
+        };
         // Tunnels carry no forwarding headers, so the metrics handler's
         // header guard can never fire for them: the connect-time check
         // is the only thing between a tunnel and the metrics listener.
@@ -670,9 +685,17 @@ impl AppState {
                 return Err(ProxyError::BadGateway);
             }
         }
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(|_| ProxyError::BadGateway)?;
+        let (mut sender, connection) =
+            match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await {
+                Ok(parts) => parts,
+                Err(_) => {
+                    self.metrics.upstream_latency(
+                        crate::metrics::UpstreamKind::WebSocket,
+                        started.elapsed(),
+                    );
+                    return Err(ProxyError::BadGateway);
+                }
+            };
         let connection_task = tokio::spawn(async move {
             if let Err(error) = connection.with_upgrades().await {
                 debug!(error = %error, "WebSocket upstream connection ended");
@@ -687,20 +710,17 @@ impl AppState {
             .map(Uri::from)
             .ok_or(ProxyError::BadRequest)?;
         let request = Request::from_parts(parts, body);
-        let started = std::time::Instant::now();
-        let mut response = match with_upload_timeout(
+        let response = with_upload_timeout(
             &upload_tracker,
             self.config.server.request_timeout,
             self.config.server.idle_timeout,
             sender.send_request(request),
         )
-        .await
-        {
-            Ok(Ok(response)) => {
-                self.metrics
-                    .upstream_latency(crate::metrics::UpstreamKind::WebSocket, started.elapsed());
-                response
-            }
+        .await;
+        self.metrics
+            .upstream_latency(crate::metrics::UpstreamKind::WebSocket, started.elapsed());
+        let mut response = match response {
+            Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 connection_task.abort();
                 return Err(upstream_request_error(error));

@@ -313,6 +313,33 @@ async fn websocket_upgrades_record_websocket_latency() {
 }
 
 #[tokio::test]
+async fn failed_upstream_requests_still_record_latency() {
+    // A bound-then-dropped address refuses connections: every upstream
+    // call fails, and must still land in the histogram (Harry, review
+    // of PR #8 — a success-only distribution flatters degradation).
+    let dead = free_addr().await;
+    let addr = free_addr().await;
+    let metrics = free_addr().await;
+    let rook = spawn_rook(
+        rook_config(addr, metrics, &format!("http://{dead}")),
+        addr,
+        metrics,
+    )
+    .await;
+
+    let (status, _, _) = get(rook.addr, "example.com", "/").await;
+    assert_eq!(status, 502);
+
+    let (status, _, body) = get(rook.metrics, "localhost", "/metrics").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("rook_upstream_failures_total 1"), "{body}");
+    assert!(
+        body.contains("rook_upstream_request_duration_seconds_count{kind=\"http\"} 1"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn anything_but_get_metrics_is_not_found_or_refused() {
     let upstream = spawn_upstream().await;
     let addr = free_addr().await;

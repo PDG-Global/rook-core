@@ -158,10 +158,14 @@ impl Metrics {
         self.inner.upstream_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// An upstream request answered: time from starting the request
-    /// (connect included) to receiving the response head — for
-    /// WebSockets, to the 101. Failures are not recorded here; they
-    /// are counted by `upstream_failed` instead.
+    /// An upstream request finished, one way or another: time from
+    /// starting it (connect included) to the response head — for
+    /// WebSockets, to the 101. Failures and timeouts are recorded too
+    /// (and counted in `upstream_failed`): excluding them would let a
+    /// degrading upstream make the success-only distribution look
+    /// *faster*, so a p99 read off this histogram must see the slow
+    /// failures (Harry, review of PR #8). A timed-out request's elapsed
+    /// is a lower bound on its true latency.
     pub fn upstream_latency(&self, kind: UpstreamKind, elapsed: std::time::Duration) {
         let secs = elapsed.as_secs_f64();
         let slot = UPSTREAM_LATENCY_BUCKETS.partition_point(|le| secs > *le);
@@ -251,7 +255,7 @@ impl Metrics {
             inner.upstream_failures.load(Ordering::Relaxed)
         );
 
-        out.push_str("# HELP rook_upstream_request_duration_seconds Time from starting an upstream request (connect included) to receiving its response head — for WebSockets, to the 101. Failures are counted in rook_upstream_failures_total, not here.\n");
+        out.push_str("# HELP rook_upstream_request_duration_seconds Time from starting an upstream request (connect included) to its outcome: response head for HTTP, validated 101 for WebSockets. Failed and timed-out requests are included (they are also counted in rook_upstream_failures_total); a timeout's elapsed is a lower bound.\n");
         out.push_str("# TYPE rook_upstream_request_duration_seconds histogram\n");
         for (name, kind) in UPSTREAM_KINDS {
             let index = kind.index();
@@ -494,9 +498,14 @@ mod tests {
             rendered.contains("# TYPE rook_process_resident_memory_bytes gauge"),
             "{rendered}"
         );
-        assert!(
-            rendered.contains(&format!("rook_process_resident_memory_bytes {bytes}")),
-            "{rendered}"
-        );
+        // The gauge line carries a plausible value. Render samples RSS
+        // again, so the number need not equal the sample above — parse
+        // the rendered one instead of comparing.
+        let rendered_bytes: u64 = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("rook_process_resident_memory_bytes "))
+            .and_then(|value| value.parse().ok())
+            .expect("gauge line present and numeric");
+        assert!(rendered_bytes > 0);
     }
 }
