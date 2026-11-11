@@ -41,6 +41,39 @@ impl Listener {
     }
 }
 
+/// What an upstream latency observation was for. A closed label set,
+/// like `Listener`: nothing request-derived ever becomes a label value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamKind {
+    Http,
+    WebSocket,
+}
+
+const UPSTREAM_KINDS: [(&str, UpstreamKind); 2] = [
+    ("http", UpstreamKind::Http),
+    ("websocket", UpstreamKind::WebSocket),
+];
+
+impl UpstreamKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Http => 0,
+            Self::WebSocket => 1,
+        }
+    }
+}
+
+/// Upper bounds (`le`) of the upstream-latency histogram, in seconds.
+/// Fixed at compile time so the registry stays fixed-memory; spans fast
+/// loopback upstreams up to the request-timeout range.
+const UPSTREAM_LATENCY_BUCKETS: [f64; 12] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Slot count: one per bucket plus one overflow slot for observations
+/// above the largest bound (the `le="+Inf"` count).
+const UPSTREAM_LATENCY_SLOTS: usize = UPSTREAM_LATENCY_BUCKETS.len() + 1;
+
 /// The shared registry. Cloning shares the counters.
 #[derive(Clone, Default)]
 pub struct Metrics {
@@ -56,6 +89,14 @@ struct Inner {
     responses_by_class: [AtomicU64; 5],
     tls_handshake_failures: AtomicU64,
     upstream_failures: AtomicU64,
+    /// Upstream request-latency histogram, by kind. Slots are
+    /// NON-cumulative (slot i counts observations in
+    /// `(bucket[i-1], bucket[i]]`, the last slot counts the rest);
+    /// rendering accumulates them into Prometheus's cumulative form.
+    upstream_latency_slots: [[AtomicU64; UPSTREAM_LATENCY_SLOTS]; 2],
+    /// Sum of observed latencies in microseconds (f64 seconds cannot
+    /// be incremented atomically).
+    upstream_latency_sum_micros: [AtomicU64; 2],
     acme_renewals_ok: AtomicU64,
     acme_renewals_failed: AtomicU64,
     /// Strike trackers to pull counters from at scrape time, labelled
@@ -115,6 +156,22 @@ impl Metrics {
     /// An upstream connect/request failed or timed out.
     pub fn upstream_failed(&self) {
         self.inner.upstream_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An upstream request finished, one way or another: time from
+    /// starting it (connect included) to the response head — for
+    /// WebSockets, to the 101. Failures and timeouts are recorded too
+    /// (and counted in `upstream_failed`): excluding them would let a
+    /// degrading upstream make the success-only distribution look
+    /// *faster*, so a p99 read off this histogram must see the slow
+    /// failures (Harry, review of PR #8). A timed-out request's elapsed
+    /// is a lower bound on its true latency.
+    pub fn upstream_latency(&self, kind: UpstreamKind, elapsed: std::time::Duration) {
+        let secs = elapsed.as_secs_f64();
+        let slot = UPSTREAM_LATENCY_BUCKETS.partition_point(|le| secs > *le);
+        self.inner.upstream_latency_slots[kind.index()][slot].fetch_add(1, Ordering::Relaxed);
+        self.inner.upstream_latency_sum_micros[kind.index()]
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
     }
 
     /// An ACME issuance/renewal attempt finished.
@@ -197,6 +254,43 @@ impl Metrics {
             "# HELP rook_upstream_failures_total Upstream requests that failed or timed out.\n# TYPE rook_upstream_failures_total counter\nrook_upstream_failures_total {}",
             inner.upstream_failures.load(Ordering::Relaxed)
         );
+
+        out.push_str("# HELP rook_upstream_request_duration_seconds Time from starting an upstream request (connect included) to its outcome: response head for HTTP, validated 101 for WebSockets. Failed and timed-out requests are included (they are also counted in rook_upstream_failures_total); a timeout's elapsed is a lower bound.\n");
+        out.push_str("# TYPE rook_upstream_request_duration_seconds histogram\n");
+        for (name, kind) in UPSTREAM_KINDS {
+            let index = kind.index();
+            let mut cumulative = 0u64;
+            for (slot, le) in UPSTREAM_LATENCY_BUCKETS.iter().enumerate() {
+                cumulative += inner.upstream_latency_slots[index][slot].load(Ordering::Relaxed);
+                let _ = writeln!(
+                    out,
+                    "rook_upstream_request_duration_seconds_bucket{{kind=\"{name}\",le=\"{le}\"}} {cumulative}"
+                );
+            }
+            let total = cumulative
+                + inner.upstream_latency_slots[index][UPSTREAM_LATENCY_SLOTS - 1]
+                    .load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "rook_upstream_request_duration_seconds_bucket{{kind=\"{name}\",le=\"+Inf\"}} {total}"
+            );
+            let micros = inner.upstream_latency_sum_micros[index].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "rook_upstream_request_duration_seconds_sum{{kind=\"{name}\"}} {}",
+                micros as f64 / 1_000_000.0
+            );
+            let _ = writeln!(
+                out,
+                "rook_upstream_request_duration_seconds_count{{kind=\"{name}\"}} {total}"
+            );
+        }
+        if let Some(bytes) = resident_memory_bytes() {
+            let _ = writeln!(
+                out,
+                "# HELP rook_process_resident_memory_bytes Current resident set size of the rookd process.\n# TYPE rook_process_resident_memory_bytes gauge\nrook_process_resident_memory_bytes {bytes}"
+            );
+        }
         let _ = writeln!(
             out,
             "# HELP rook_acme_renewals_total ACME issuance/renewal attempts, by result.\n# TYPE rook_acme_renewals_total counter\nrook_acme_renewals_total{{result=\"success\"}} {}\nrook_acme_renewals_total{{result=\"failure\"}} {}",
@@ -252,6 +346,15 @@ fn escape_label(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+/// Current resident set size of this process, in bytes, via the
+/// `memory-stats` crate (its per-platform `unsafe` stays outside this
+/// `#![forbid(unsafe_code)]` crate; Linux/Android, macOS/iOS, FreeBSD
+/// and Windows are covered). Unsupported platforms return `None` and
+/// the gauge is simply omitted from the scrape.
+fn resident_memory_bytes() -> Option<u64> {
+    memory_stats::memory_stats().map(|stats| stats.physical_mem as u64)
 }
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -335,5 +438,74 @@ mod tests {
     #[test]
     fn labels_are_escaped() {
         assert_eq!(escape_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn upstream_latency_renders_cumulative_histogram() {
+        let metrics = Metrics::default();
+        // 3 ms -> bucket 0.005; 40 ms -> 0.05; 700 ms -> 1.0;
+        // 60 s -> overflow slot (only visible in le="+Inf").
+        metrics.upstream_latency(UpstreamKind::Http, std::time::Duration::from_millis(3));
+        metrics.upstream_latency(UpstreamKind::Http, std::time::Duration::from_millis(40));
+        metrics.upstream_latency(UpstreamKind::Http, std::time::Duration::from_millis(700));
+        metrics.upstream_latency(UpstreamKind::Http, std::time::Duration::from_secs(60));
+        metrics.upstream_latency(UpstreamKind::WebSocket, std::time::Duration::from_millis(8));
+
+        let rendered = metrics.render(0);
+        // Cumulative: each le line counts everything at or below it.
+        assert!(
+            rendered.contains(
+                "rook_upstream_request_duration_seconds_bucket{kind=\"http\",le=\"0.005\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains(
+            "rook_upstream_request_duration_seconds_bucket{kind=\"http\",le=\"0.05\"} 2"
+        ));
+        assert!(
+            rendered.contains(
+                "rook_upstream_request_duration_seconds_bucket{kind=\"http\",le=\"1\"} 3"
+            )
+        );
+        assert!(
+            rendered.contains(
+                "rook_upstream_request_duration_seconds_bucket{kind=\"http\",le=\"30\"} 3"
+            )
+        );
+        assert!(rendered.contains(
+            "rook_upstream_request_duration_seconds_bucket{kind=\"http\",le=\"+Inf\"} 4"
+        ));
+        assert!(rendered.contains("rook_upstream_request_duration_seconds_count{kind=\"http\"} 4"));
+        // Sum: 3 + 40 + 700 + 60000 ms = 60.743 s.
+        assert!(
+            rendered.contains("rook_upstream_request_duration_seconds_sum{kind=\"http\"} 60.743")
+        );
+        // Kinds are independent series.
+        assert!(
+            rendered.contains("rook_upstream_request_duration_seconds_count{kind=\"websocket\"} 1")
+        );
+        assert!(rendered.contains(
+            "rook_upstream_request_duration_seconds_bucket{kind=\"websocket\",le=\"0.01\"} 1"
+        ));
+    }
+
+    #[test]
+    fn resident_memory_gauge_renders_on_supported_platforms() {
+        let bytes = resident_memory_bytes().expect("getrusage works on unix test targets");
+        assert!(bytes > 0);
+        let rendered = Metrics::default().render(0);
+        assert!(
+            rendered.contains("# TYPE rook_process_resident_memory_bytes gauge"),
+            "{rendered}"
+        );
+        // The gauge line carries a plausible value. Render samples RSS
+        // again, so the number need not equal the sample above — parse
+        // the rendered one instead of comparing.
+        let rendered_bytes: u64 = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("rook_process_resident_memory_bytes "))
+            .and_then(|value| value.parse().ok())
+            .expect("gauge line present and numeric");
+        assert!(rendered_bytes > 0);
     }
 }
