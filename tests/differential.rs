@@ -49,6 +49,17 @@ impl Drop for ChildGuard {
     }
 }
 
+/// What the capturing upstream reports. `Raw` is every byte read,
+/// teed before parsing: desync shows up as bytes that never form a
+/// request (a partial head at EOF, an over-long head, leftovers in the
+/// buffer), so asserting only on parsed `Request`s would be blind to
+/// exactly that (Thomas, review of PR #9).
+#[derive(Debug)]
+enum UpstreamEvent {
+    Raw(Vec<u8>),
+    Request(Captured),
+}
+
 /// One request the upstream received, as raw head + body bytes.
 #[derive(Debug)]
 struct Captured {
@@ -66,11 +77,15 @@ impl Captured {
     }
 }
 
-/// A minimal HTTP/1.1 server that captures every request it parses and
-/// answers 200. Parses Content-Length and chunked bodies so keep-alive
-/// framing stays aligned; a request it cannot frame closes the
-/// connection.
-async fn spawn_capture_upstream() -> (SocketAddr, mpsc::UnboundedReceiver<Captured>) {
+fn contains_marker(bytes: &[u8]) -> bool {
+    bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes())
+}
+
+/// A minimal HTTP/1.1 server that tees every byte it reads, captures
+/// every request it parses, and answers 200. Parses Content-Length and
+/// chunked bodies so keep-alive framing stays aligned; a request it
+/// cannot frame closes the connection.
+async fn spawn_capture_upstream() -> (SocketAddr, mpsc::UnboundedReceiver<UpstreamEvent>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
@@ -86,9 +101,22 @@ async fn spawn_capture_upstream() -> (SocketAddr, mpsc::UnboundedReceiver<Captur
     (addr, rx)
 }
 
+/// One read, teed into the event channel before anything parses it.
+async fn read_teed(
+    stream: &mut TcpStream,
+    chunk: &mut [u8; 8192],
+    tx: &mpsc::UnboundedSender<UpstreamEvent>,
+) -> std::io::Result<usize> {
+    let read = stream.read(chunk).await?;
+    if read > 0 {
+        let _ = tx.send(UpstreamEvent::Raw(chunk[..read].to_vec()));
+    }
+    Ok(read)
+}
+
 async fn serve_capturing(
     mut stream: TcpStream,
-    tx: mpsc::UnboundedSender<Captured>,
+    tx: mpsc::UnboundedSender<UpstreamEvent>,
 ) -> std::io::Result<()> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -98,7 +126,7 @@ async fn serve_capturing(
             if let Some(end) = find_subslice(&buffer, b"\r\n\r\n") {
                 break end + 4;
             }
-            let read = stream.read(&mut chunk).await?;
+            let read = read_teed(&mut stream, &mut chunk, &tx).await?;
             if read == 0 {
                 return Ok(());
             }
@@ -126,7 +154,7 @@ async fn serve_capturing(
             });
         let body = if let Some(length) = content_length {
             while buffer.len() < length {
-                let read = stream.read(&mut chunk).await?;
+                let read = read_teed(&mut stream, &mut chunk, &tx).await?;
                 if read == 0 {
                     break;
                 }
@@ -136,11 +164,11 @@ async fn serve_capturing(
             buffer.drain(..body.len());
             body
         } else if chunked {
-            read_chunked(&mut stream, &mut buffer, &mut chunk).await?
+            read_chunked(&mut stream, &mut buffer, &mut chunk, &tx).await?
         } else {
             Vec::new()
         };
-        let _ = tx.send(Captured { head, body });
+        let _ = tx.send(UpstreamEvent::Request(Captured { head, body }));
         stream
             .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
             .await?;
@@ -154,6 +182,7 @@ async fn read_chunked(
     stream: &mut TcpStream,
     buffer: &mut Vec<u8>,
     chunk: &mut [u8; 8192],
+    tx: &mpsc::UnboundedSender<UpstreamEvent>,
 ) -> std::io::Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
@@ -164,7 +193,7 @@ async fn read_chunked(
                 buffer.drain(..end + 2);
                 break line;
             }
-            let read = stream.read(chunk).await?;
+            let read = read_teed(stream, chunk, tx).await?;
             if read == 0 {
                 return Ok(body);
             }
@@ -186,7 +215,7 @@ async fn read_chunked(
                     buffer.drain(..2);
                     break;
                 }
-                let read = stream.read(chunk).await?;
+                let read = read_teed(stream, chunk, tx).await?;
                 if read == 0 {
                     break;
                 }
@@ -198,7 +227,7 @@ async fn read_chunked(
             return Ok(body);
         }
         while buffer.len() < size + 2 {
-            let read = stream.read(chunk).await?;
+            let read = read_teed(stream, chunk, tx).await?;
             if read == 0 {
                 return Ok(body);
             }
@@ -422,6 +451,18 @@ async fn smuggling_corpus_never_reaches_the_upstream() {
     let (caddy_upstream, mut caddy_rx) = spawn_capture_upstream().await;
     let (rook_addr, _rook) = spawn_rook(rook_upstream).await;
     let caddy = spawn_caddy(caddy_upstream);
+    // A missing Caddy must not fail silently: a green "differential"
+    // run that compared against nothing is worse than a red one (Harry,
+    // review of PR #9). Skip only with an explicit opt-out.
+    if caddy.is_none() {
+        assert!(
+            std::env::var_os("ROOK_DIFFERENTIAL_NO_CADDY").is_some(),
+            "caddy not on PATH; set ROOK_DIFFERENTIAL_NO_CADDY=1 to run rook-only"
+        );
+        eprintln!(
+            "differential: caddy not on PATH — caddy half SKIPPED (ROOK_DIFFERENTIAL_NO_CADDY)"
+        );
+    }
     if let Some((addr, _)) = &caddy {
         assert!(
             wait_for_port(*addr, IO_TIMEOUT).await,
@@ -440,19 +481,27 @@ async fn smuggling_corpus_never_reaches_the_upstream() {
         table.push((name, rook_status, caddy_status));
     }
 
-    // Give any in-flight upstream delivery a moment, then drain.
+    // Give any in-flight upstream delivery a moment, then drain both
+    // the parsed requests and the raw teed bytes.
     sleep(Duration::from_millis(300)).await;
     let mut rook_seen = Vec::new();
-    while let Ok(request) = rook_rx.try_recv() {
-        rook_seen.push(request);
+    let mut rook_raw: Vec<u8> = Vec::new();
+    while let Ok(event) = rook_rx.try_recv() {
+        match event {
+            UpstreamEvent::Raw(bytes) => rook_raw.extend_from_slice(&bytes),
+            UpstreamEvent::Request(request) => rook_seen.push(request),
+        }
     }
     let mut caddy_seen = Vec::new();
-    while let Ok(request) = caddy_rx.try_recv() {
-        caddy_seen.push(request);
+    while let Ok(event) = caddy_rx.try_recv() {
+        if let UpstreamEvent::Request(request) = event {
+            caddy_seen.push(request);
+        }
     }
 
-    // The property: no marker Rook rejected ever reaches its upstream —
-    // not as a request line, not inside a body.
+    // The property, on both views: no marker Rook rejected ever reaches
+    // its upstream — not as a parsed request, and not as raw bytes that
+    // never formed one (which is exactly how a desync would surface).
     for request in &rook_seen {
         assert!(
             !request.mentions_marker(),
@@ -460,6 +509,10 @@ async fn smuggling_corpus_never_reaches_the_upstream() {
             request.head
         );
     }
+    assert!(
+        !contains_marker(&rook_raw),
+        "rook's upstream received marker bytes in the raw stream"
+    );
     // Rook is deliberately strict: every ambiguous entry is refused
     // outright rather than normalized-and-forwarded.
     for (name, rook_status, _) in &table {
@@ -496,4 +549,33 @@ async fn smuggling_corpus_never_reaches_the_upstream() {
             );
         }
     }
+}
+
+/// Negative control for the raw check (Thomas): send the marker through
+/// a request Rook SHOULD accept (an ordinary custom header crosses
+/// intact), and prove the raw assertion can see it. Without this, a
+/// broken tee would pass the corpus test forever.
+#[tokio::test]
+async fn raw_marker_check_is_live() {
+    let (upstream, mut rx) = spawn_capture_upstream().await;
+    let (rook_addr, _rook) = spawn_rook(upstream).await;
+
+    let status = send_raw(
+        rook_addr,
+        &format!("GET / HTTP/1.1\r\nHost: example.com\r\nX-Note: {MARKER}\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status, Some(200), "rook should accept and forward this");
+
+    sleep(Duration::from_millis(300)).await;
+    let mut raw: Vec<u8> = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let UpstreamEvent::Raw(bytes) = event {
+            raw.extend_from_slice(&bytes);
+        }
+    }
+    assert!(
+        contains_marker(&raw),
+        "raw check could not see a marker that was definitely sent — the tee is blind"
+    );
 }
