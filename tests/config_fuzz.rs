@@ -3,7 +3,10 @@
 //!
 //! - a deterministic mutation corpus: a known-valid config mutated by a
 //!   seeded xorshift (truncations, char swaps, token insertions) — every
-//!   outcome must be `Ok` or `Err`, never a panic;
+//!   outcome must be `Ok` or `Err`, never a panic, and every accepted
+//!   (`Ok`) config must still satisfy the security invariants validation
+//!   promises (loopback-only metrics, non-zero limits and timeouts,
+//!   per-site strike rules that can actually count);
 //! - an adversarial list of hand-picked inputs (deep nesting, huge
 //!   numbers, null bytes, bidi controls, duplicate keys, megabyte
 //!   values) with a per-input wall-clock bound.
@@ -13,9 +16,172 @@
 //! in `fuzz/` covers the byte-stream side; this file covers the config
 //! side.
 
-use std::time::{Duration, Instant};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use rookd::config::Config;
+
+/// Wall-clock budget for a single parse. Generous for a debug build;
+/// the mutation corpus parses in microseconds, so 5s means "hung",
+/// not "slow".
+const PARSE_BUDGET: Duration = Duration::from_secs(5);
+
+/// One parse, observed from the outside.
+enum Outcome {
+    /// The parser answered: `Ok(config)` or a normal `Err` — both fine.
+    Parsed(Result<Config, String>),
+    /// The parser panicked; the worker already printed the seed.
+    Panicked,
+}
+
+/// Parse `input` on a worker thread with a wall-clock budget, so the
+/// two failure modes this file exists for are both caught: a panic
+/// (caught in the worker, reported with its seed, failed on the main
+/// thread) and a hang (the stopwatch lives here, so it fires even when
+/// the parse never returns). A genuinely hung worker leaks and keeps
+/// the process alive — CI's own per-test timeout is the backstop, and
+/// the panic message names the seed either way.
+fn parse_bounded(label: &str, seed: u64, input: String) -> Result<Config, String> {
+    let (tx, rx) = mpsc::channel();
+    let label = label.to_string();
+    let worker_label = label.clone();
+    thread::spawn(move || {
+        let outcome = match catch_unwind(AssertUnwindSafe(|| {
+            Config::parse(&input).map_err(|e| e.to_string())
+        })) {
+            Ok(result) => Outcome::Parsed(result),
+            Err(_) => {
+                // The seed must be visible even if the harness output
+                // is lost: stderr first, then the main thread panics.
+                eprintln!("config_fuzz: parser panicked (label={worker_label}, seed={seed})");
+                Outcome::Panicked
+            }
+        };
+        // If the main thread already timed out, nobody is listening;
+        // the eprintln above still records the seed.
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(PARSE_BUDGET) {
+        Ok(Outcome::Parsed(result)) => result,
+        Ok(Outcome::Panicked) => {
+            panic!(
+                "config_fuzz: parser panicked (label={label}, seed={seed}) — rerun reproduces exactly"
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "config_fuzz: parse exceeded {PARSE_BUDGET:?} (label={label}, seed={seed}) — a parse must never hang"
+        ),
+        Err(e) => {
+            panic!("config_fuzz: worker died without reporting (label={label}, seed={seed}): {e}")
+        }
+    }
+}
+
+/// The invariants `Config::parse` validation promises. A mutation that
+/// is ACCEPTED (`Ok`) must still uphold every one of them; otherwise
+/// the mutator found a validation hole a panic would never reveal.
+fn assert_accepted_invariants(label: &str, seed: u64, config: &Config) {
+    let ctx = || format!("(label={label}, seed={seed})");
+    let s = &config.server;
+    // Metrics never binds off-loopback.
+    assert!(
+        config.metrics.listen.ip().is_loopback(),
+        "metrics.listen escaped loopback {}",
+        ctx()
+    );
+    // Non-zero limits.
+    assert!(s.max_connections > 0, "max_connections {}", ctx());
+    assert!(
+        s.max_connections_per_ip > 0,
+        "max_connections_per_ip {}",
+        ctx()
+    );
+    assert!(
+        s.max_connections_per_upstream > 0,
+        "max_connections_per_upstream {}",
+        ctx()
+    );
+    assert!(s.max_upstream_per_ip > 0, "max_upstream_per_ip {}", ctx());
+    assert!(s.max_tracked_clients > 0, "max_tracked_clients {}", ctx());
+    assert!(s.requests_per_second > 0, "requests_per_second {}", ctx());
+    assert!(s.request_burst > 0, "request_burst {}", ctx());
+    assert!(
+        s.max_request_body_bytes > 0,
+        "max_request_body_bytes {}",
+        ctx()
+    );
+    assert!(
+        (8192..=16 * 1024 * 1024).contains(&s.max_header_bytes),
+        "max_header_bytes {}",
+        ctx()
+    );
+    assert!(
+        s.request_burst >= s.requests_per_second,
+        "burst >= rps {}",
+        ctx()
+    );
+    // Non-zero timeouts.
+    for (name, t) in [
+        ("header_read_timeout", s.header_read_timeout),
+        ("request_timeout", s.request_timeout),
+        ("upstream_connect_timeout", s.upstream_connect_timeout),
+        ("idle_timeout", s.idle_timeout),
+        ("websocket_idle_timeout", s.websocket_idle_timeout),
+        ("websocket_max_lifetime", s.websocket_max_lifetime),
+        ("shutdown_drain", s.shutdown_drain),
+    ] {
+        assert!(t > Duration::ZERO, "{name} non-zero {}", ctx());
+    }
+    // HSTS preload implies its prerequisites.
+    if s.hsts_preload {
+        assert!(
+            s.hsts_include_subdomains,
+            "preload needs subdomains {}",
+            ctx()
+        );
+        assert!(
+            s.hsts_max_age >= 31_536_000,
+            "preload needs max-age {}",
+            ctx()
+        );
+    }
+    // Sites: at least one, each with hosts and routes.
+    assert!(!config.sites.is_empty(), "at least one site {}", ctx());
+    let mut all_hosts = std::collections::HashSet::new();
+    for site in &config.sites {
+        assert!(!site.hosts.is_empty(), "site hosts non-empty {}", ctx());
+        for host in &site.hosts {
+            assert!(!host.is_empty(), "host non-empty {}", ctx());
+            assert!(all_hosts.insert(host), "duplicate host {host:?} {}", ctx());
+        }
+        assert!(!site.routes.is_empty(), "site routes non-empty {}", ctx());
+        let mut prefixes = std::collections::HashSet::new();
+        for route in &site.routes {
+            assert!(route.prefix.starts_with('/'), "absolute prefix {}", ctx());
+            assert!(prefixes.insert(&route.prefix), "duplicate prefix {}", ctx());
+            assert!(
+                !route.upstreams.is_empty(),
+                "route upstreams non-empty {}",
+                ctx()
+            );
+        }
+        // Strike rules, when present, can actually count and ban.
+        if site.strikes.enabled {
+            assert!(site.strikes.threshold >= 1, "strike threshold {}", ctx());
+            assert!(site.strikes.window_secs > 0, "strike window {}", ctx());
+            assert!(site.strikes.ban_secs > 0, "strike ban {}", ctx());
+            for path in &site.strikes.trap_paths {
+                assert!(
+                    path.starts_with('/') && !path.contains('?') && !path.contains('#'),
+                    "trap path shape {}",
+                    ctx()
+                );
+            }
+        }
+    }
+}
 
 /// A valid baseline config, exercising every section.
 const VALID: &str = r#"
@@ -169,16 +335,18 @@ fn mutate(input: &str, seed: u64) -> String {
 
 #[test]
 fn parse_never_panics_across_a_seeded_mutation_corpus() {
-    // A panic anywhere in here fails the test with the seed in the
-    // assertion output; re-running that seed reproduces it exactly.
+    // A panic or hang anywhere in here fails the test with the seed in
+    // the assertion output; re-running that seed reproduces it exactly.
     for seed in 0..4096u64 {
         let input = mutate(VALID, seed);
-        let _ = Config::parse(&input);
+        if let Ok(config) = parse_bounded("mutated-valid", seed, input) {
+            assert_accepted_invariants("mutated-valid", seed, &config);
+        }
     }
     // Mutating the empty string and pure whitespace too.
     for seed in 0..256u64 {
-        let _ = Config::parse(&mutate("", seed));
-        let _ = Config::parse(&mutate("\n  \n", seed));
+        let _ = parse_bounded("mutated-empty", seed, mutate("", seed));
+        let _ = parse_bounded("mutated-whitespace", seed, mutate("\n  \n", seed));
     }
 }
 
@@ -220,14 +388,12 @@ fn parse_handles_adversarial_inputs_without_panicking_or_hanging() {
             format!("{VALID}\n\u{0}garbage{{{{["),
         ),
     ];
-    for (name, input) in inputs {
-        let start = Instant::now();
-        let _ = Config::parse(&input);
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "{name}: parse took {:?} — a parse must be fast even on adversarial input",
-            start.elapsed()
-        );
+    for (i, (name, input)) in inputs.into_iter().enumerate() {
+        // Same worker-thread budget as the mutation corpus: the old
+        // stopwatch-after-return could never fire on a true hang.
+        if let Ok(config) = parse_bounded(name, i as u64, input) {
+            assert_accepted_invariants(name, i as u64, &config);
+        }
     }
 }
 
