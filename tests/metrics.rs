@@ -81,6 +81,7 @@ hosts = ["example.com"]
 [[sites.routes]]
 prefix = "/"
 upstreams = ["{upstream}"]
+websocket = true
 "#
     )
 }
@@ -217,6 +218,98 @@ async fn serves_prometheus_text_on_get_metrics() {
         "{body}"
     );
     assert!(body.contains("rook_strikes_total"), "{body}");
+    // The proxied GET recorded one http-kind latency observation.
+    assert!(
+        body.contains("rook_upstream_request_duration_seconds_count{kind=\"http\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("rook_upstream_request_duration_seconds_count{kind=\"websocket\"} 0"),
+        "{body}"
+    );
+    assert!(body.contains("le=\"+Inf\"}"), "{body}");
+    // The resident-memory gauge renders on every supported platform.
+    assert!(
+        body.contains("# TYPE rook_process_resident_memory_bytes gauge"),
+        "{body}"
+    );
+}
+
+/// A minimal upstream that upgrades every request and then holds the
+/// tunnel open, so the proxy records a websocket-kind latency.
+async fn spawn_websocket_upstream() -> SocketAddr {
+    // Sec-WebSocket-Accept for the fixed key sent below.
+    const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {ACCEPT}\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                // Hold the tunnel until the peer goes away.
+                let mut sink = [0u8; 64];
+                while let Ok(n) = stream.read(&mut sink).await {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn websocket_upgrades_record_websocket_latency() {
+    let upstream = spawn_websocket_upstream().await;
+    let addr = free_addr().await;
+    let metrics = free_addr().await;
+    let rook = spawn_rook(
+        rook_config(addr, metrics, &format!("http://{upstream}")),
+        addr,
+        metrics,
+    )
+    .await;
+
+    // A WebSocket upgrade; the fixed key matches the upstream's Accept.
+    let mut stream = TcpStream::connect(rook.addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut buffer = [0u8; 4096];
+    let read = timeout(IO_TIMEOUT, stream.read(&mut buffer))
+        .await
+        .expect("timed out reading the 101")
+        .unwrap();
+    let head = String::from_utf8_lossy(&buffer[..read]);
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    drop(stream);
+
+    let (status, _, body) = get(rook.metrics, "localhost", "/metrics").await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("rook_upstream_request_duration_seconds_count{kind=\"websocket\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("rook_upstream_request_duration_seconds_count{kind=\"http\"} 0"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

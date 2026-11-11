@@ -604,6 +604,7 @@ impl AppState {
         upstream_wait: Option<UpstreamWaitGuard>,
     ) -> ProxyResult {
         let _upstream_wait = upstream_wait;
+        let started = std::time::Instant::now();
         let response = with_upload_timeout(
             &upload_tracker,
             self.config.server.request_timeout,
@@ -612,6 +613,8 @@ impl AppState {
         )
         .await?
         .map_err(upstream_request_error)?;
+        self.metrics
+            .upstream_latency(crate::metrics::UpstreamKind::Http, started.elapsed());
         Ok(map_response(
             response,
             self.config.server.idle_timeout,
@@ -684,6 +687,7 @@ impl AppState {
             .map(Uri::from)
             .ok_or(ProxyError::BadRequest)?;
         let request = Request::from_parts(parts, body);
+        let started = std::time::Instant::now();
         let mut response = match with_upload_timeout(
             &upload_tracker,
             self.config.server.request_timeout,
@@ -692,7 +696,11 @@ impl AppState {
         )
         .await
         {
-            Ok(Ok(response)) => response,
+            Ok(Ok(response)) => {
+                self.metrics
+                    .upstream_latency(crate::metrics::UpstreamKind::WebSocket, started.elapsed());
+                response
+            }
             Ok(Err(error)) => {
                 connection_task.abort();
                 return Err(upstream_request_error(error));
