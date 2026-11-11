@@ -31,7 +31,9 @@ const PARSE_BUDGET: Duration = Duration::from_secs(5);
 /// One parse, observed from the outside.
 enum Outcome {
     /// The parser answered: `Ok(config)` or a normal `Err` — both fine.
-    Parsed(Result<Config, String>),
+    /// Boxed: `Config` is large and `Panicked` is a unit, and clippy
+    /// rightly refuses the size asymmetry.
+    Parsed(Result<Box<Config>, String>),
     /// The parser panicked; the worker already printed the seed.
     Panicked,
 }
@@ -43,13 +45,15 @@ enum Outcome {
 /// the parse never returns). A genuinely hung worker leaks and keeps
 /// the process alive — CI's own per-test timeout is the backstop, and
 /// the panic message names the seed either way.
-fn parse_bounded(label: &str, seed: u64, input: String) -> Result<Config, String> {
+fn parse_bounded(label: &str, seed: u64, input: String) -> Result<Box<Config>, String> {
     let (tx, rx) = mpsc::channel();
     let label = label.to_string();
     let worker_label = label.clone();
     thread::spawn(move || {
         let outcome = match catch_unwind(AssertUnwindSafe(|| {
-            Config::parse(&input).map_err(|e| e.to_string())
+            Config::parse(&input)
+                .map(Box::new)
+                .map_err(|e| e.to_string())
         })) {
             Ok(result) => Outcome::Parsed(result),
             Err(_) => {
@@ -153,9 +157,31 @@ fn assert_accepted_invariants(label: &str, seed: u64, config: &Config) {
     for site in &config.sites {
         assert!(!site.hosts.is_empty(), "site hosts non-empty {}", ctx());
         for host in &site.hosts {
+            // Host matching is the routing boundary: normalized
+            // lowercase, no wildcard, no port, no whitespace or
+            // control characters.
             assert!(!host.is_empty(), "host non-empty {}", ctx());
+            assert_eq!(host, &host.to_lowercase(), "host lowercase {}", ctx());
+            assert!(!host.contains('*'), "host has no wildcard {}", ctx());
+            assert!(
+                !host.contains(':') && !host.contains('[') && !host.contains(']'),
+                "host carries no port/brackets {}",
+                ctx()
+            );
+            assert!(
+                !host.chars().any(|c| c.is_whitespace() || c.is_control()),
+                "host free of whitespace/control {}",
+                ctx()
+            );
             assert!(all_hosts.insert(host), "duplicate host {host:?} {}", ctx());
         }
+        // TLS material comes in pairs: both or neither.
+        assert_eq!(
+            site.tls_cert.is_some(),
+            site.tls_key.is_some(),
+            "tls_cert/tls_key both or neither {}",
+            ctx()
+        );
         assert!(!site.routes.is_empty(), "site routes non-empty {}", ctx());
         let mut prefixes = std::collections::HashSet::new();
         for route in &site.routes {
@@ -166,6 +192,28 @@ fn assert_accepted_invariants(label: &str, seed: u64, config: &Config) {
                 "route upstreams non-empty {}",
                 ctx()
             );
+            // Without allow_remote_http, every upstream stays loopback
+            // (mirrors config::is_loopback_host, which is private).
+            if !route.allow_remote_http {
+                for upstream in &route.upstreams {
+                    let host = upstream.host().unwrap_or_default();
+                    let unbracketed = host
+                        .strip_prefix('[')
+                        .and_then(|h| h.strip_suffix(']'))
+                        .unwrap_or(host);
+                    let loopback = unbracketed
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+                        || unbracketed
+                            .strip_suffix('.')
+                            .unwrap_or(unbracketed)
+                            .eq_ignore_ascii_case("localhost")
+                        || unbracketed
+                            .rsplit_once('.')
+                            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("localhost"));
+                    assert!(loopback, "upstream {upstream} loopback {}", ctx());
+                }
+            }
         }
         // Strike rules, when present, can actually count and ban.
         if site.strikes.enabled {
