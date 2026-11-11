@@ -953,6 +953,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "x509-parser",

@@ -7,6 +7,7 @@ pub mod config;
 pub mod framing;
 pub mod io;
 pub mod limit;
+pub mod metrics;
 pub mod path;
 pub mod proxy;
 pub mod server;

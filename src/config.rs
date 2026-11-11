@@ -16,6 +16,30 @@ use thiserror::Error;
 pub struct Config {
     pub server: ServerConfig,
     pub sites: Vec<SiteConfig>,
+    pub metrics: MetricsConfig,
+}
+
+/// The loopback-only operational metrics endpoint (plan §8).
+///
+/// Disabled by default. The listener only ever binds a loopback
+/// address: a non-loopback `listen` is a config error even while the
+/// endpoint is disabled, so no edit can turn the file into a public
+/// metrics listener. `listen` parses as a numeric `SocketAddr`, so a
+/// hostname that might resolve differently on different hosts is a
+/// parse error, not a loophole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub listen: SocketAddr,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9188)),
+        }
+    }
 }
 
 /// Server-wide connection, request, and timeout limits.
@@ -152,6 +176,25 @@ struct RawConfig {
     server: RawServerConfig,
     #[serde(default)]
     sites: Vec<RawSiteConfig>,
+    #[serde(default)]
+    metrics: RawMetricsConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawMetricsConfig {
+    enabled: bool,
+    listen: String,
+}
+
+impl Default for RawMetricsConfig {
+    fn default() -> Self {
+        let d = MetricsConfig::default();
+        Self {
+            enabled: d.enabled,
+            listen: d.listen.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +338,7 @@ impl TryFrom<RawConfig> for Config {
 
     fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
         let server = parse_server(raw.server)?;
+        let metrics = parse_metrics(raw.metrics)?;
         if raw.sites.is_empty() {
             return Err(validation("sites", "at least one site is required"));
         }
@@ -305,9 +349,88 @@ impl TryFrom<RawConfig> for Config {
             let site = parse_site(site_index, raw_site, &server, &mut hosts_seen)?;
             sites.push(site);
         }
+        reject_metrics_upstream(&metrics, &sites)?;
 
-        Ok(Self { server, sites })
+        Ok(Self {
+            server,
+            sites,
+            metrics,
+        })
     }
+}
+
+fn parse_metrics(raw: RawMetricsConfig) -> Result<MetricsConfig, ConfigError> {
+    // `SocketAddr` parsing never resolves hostnames: "localhost:9188"
+    // is an error here, which is what keeps the loopback check below
+    // from depending on DNS.
+    let listen = raw.listen.parse::<SocketAddr>().map_err(|error| {
+        validation("metrics.listen", format!("invalid socket address: {error}"))
+    })?;
+    if !listen.ip().is_loopback() {
+        return Err(validation(
+            "metrics.listen",
+            "metrics only binds loopback addresses; a public metrics listener is never allowed",
+        ));
+    }
+    Ok(MetricsConfig {
+        enabled: raw.enabled,
+        listen,
+    })
+}
+
+/// Thomas's guard: a route or tunnel whose upstream *is* the metrics
+/// listener would publish `/metrics` through the proxy even though the
+/// listener itself is loopback-only. Reject the literal case at load;
+/// names that resolve to the listener later are refused at connect
+/// time by the guarded connector (see `proxy::GuardedConnector`).
+fn reject_metrics_upstream(
+    metrics: &MetricsConfig,
+    sites: &[SiteConfig],
+) -> Result<(), ConfigError> {
+    if !metrics.enabled {
+        return Ok(());
+    }
+    for (site_index, site) in sites.iter().enumerate() {
+        for (route_index, route) in site.routes.iter().enumerate() {
+            for (upstream_index, upstream) in route.upstreams.iter().enumerate() {
+                if upstream_matches_listener(upstream, metrics.listen) {
+                    return Err(validation(
+                        format!(
+                            "sites[{site_index}].routes[{route_index}].upstreams[{upstream_index}]"
+                        ),
+                        "upstream is the metrics listener; proxying to it would publish /metrics",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Does this upstream URL address the metrics listener exactly? Only
+/// IP literals answer here; names that resolve to the listener later
+/// are refused at connect time (`proxy::GuardedConnector`). The port
+/// defaults by scheme (Harry, review of PR #7: `https:` with no port
+/// means 443 at connect time, so the two guards must agree).
+fn upstream_matches_listener(upstream: &Uri, listen: SocketAddr) -> bool {
+    let Some(host) = upstream.host() else {
+        return false;
+    };
+    // Uri::host() keeps the brackets on IPv6 literals.
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let default_port = if upstream.scheme_str() == Some("https") {
+        443
+    } else {
+        80
+    };
+    let port = upstream.port_u16().unwrap_or(default_port);
+    ip.to_canonical() == listen.ip() && port == listen.port()
 }
 
 fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
@@ -1515,5 +1638,118 @@ upstreams = ["http://127.0.0.1"]
             let error = Config::parse(&input).unwrap_err().to_string();
             assert!(error.contains("sites[0].routes[0].origins[0]"), "{error}");
         }
+    }
+
+    #[test]
+    fn metrics_defaults_to_disabled_on_loopback() {
+        let config = Config::parse(minimal_config()).unwrap();
+        assert!(!config.metrics.enabled);
+        assert_eq!(config.metrics.listen, "127.0.0.1:9188".parse().unwrap());
+    }
+
+    #[test]
+    fn metrics_accepts_only_loopback() {
+        for (listen, ok) in [
+            ("127.0.0.1:9188", true),
+            ("[::1]:9188", true),
+            // The two that look harmless but publish to everyone.
+            ("0.0.0.0:9188", false),
+            ("[::]:9188", false),
+            ("192.0.2.1:9188", false),
+        ] {
+            let input = format!(
+                "[metrics]\nenabled = true\nlisten = '{listen}'\n{}",
+                minimal_config()
+            );
+            let parsed = Config::parse(&input);
+            assert_eq!(parsed.is_ok(), ok, "listen = {listen}");
+            if let Err(error) = parsed {
+                assert!(error.to_string().contains("metrics.listen"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_rejects_a_non_loopback_listen_even_when_disabled() {
+        let input = format!("[metrics]\nlisten = '0.0.0.0:9188'\n{}", minimal_config());
+        assert!(Config::parse(&input).is_err());
+    }
+
+    #[test]
+    fn metrics_listen_never_resolves_hostnames() {
+        // "localhost" happens to resolve to loopback on most hosts, so a
+        // resolving parser would accept it; a SocketAddr parser does not.
+        let input = format!(
+            "[metrics]\nenabled = true\nlisten = 'localhost:9188'\n{}",
+            minimal_config()
+        );
+        assert!(Config::parse(&input).is_err());
+    }
+
+    #[test]
+    fn metrics_upstream_match_defaults_the_port_by_scheme() {
+        // Harry's review point: the load-time guard must default the
+        // port the way the connector does, or an https upstream with no
+        // port would slip past it onto a listener on 443.
+        let listen_443: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let listen_80: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        assert!(upstream_matches_listener(
+            &"https://127.0.0.1".parse().unwrap(),
+            listen_443
+        ));
+        assert!(!upstream_matches_listener(
+            &"http://127.0.0.1".parse().unwrap(),
+            listen_443
+        ));
+        assert!(upstream_matches_listener(
+            &"http://127.0.0.1".parse().unwrap(),
+            listen_80
+        ));
+        assert!(upstream_matches_listener(
+            &"https://127.0.0.1:443".parse().unwrap(),
+            listen_443
+        ));
+        assert!(!upstream_matches_listener(
+            &"https://127.0.0.1:444".parse().unwrap(),
+            listen_443
+        ));
+        assert!(!upstream_matches_listener(
+            &"https://127.0.0.2".parse().unwrap(),
+            listen_443
+        ));
+        // Names never answer here; the connect-time guard owns them.
+        assert!(!upstream_matches_listener(
+            &"http://localhost:80".parse().unwrap(),
+            listen_80
+        ));
+    }
+
+    #[test]
+    fn metrics_rejects_an_upstream_that_is_the_listener() {
+        let upstream = config_with_upstream("http://127.0.0.1:9188");
+        let enabled = format!("[metrics]\nenabled = true\n{upstream}");
+        let error = Config::parse(&enabled).unwrap_err().to_string();
+        assert!(error.contains("upstreams[0]"), "{error}");
+
+        // Disabled metrics: nothing is listening, so the route stands.
+        assert!(Config::parse(&upstream).is_ok());
+        // A different port is a different service.
+        let other_port = format!(
+            "[metrics]\nenabled = true\n{}",
+            config_with_upstream("http://127.0.0.1:9189")
+        );
+        assert!(Config::parse(&other_port).is_ok());
+        // An IPv4-mapped literal is the same listener (allow_remote_http
+        // so the route itself validates and the metrics guard is the
+        // thing under test).
+        let mapped = "[metrics]\nenabled = true\n[[sites]]\nhosts = ['example.com']\n[[sites.routes]]\nprefix = '/'\nupstreams = ['http://[::ffff:127.0.0.1]:9188']\nallow_remote_http = true\n";
+        let error = Config::parse(mapped).unwrap_err().to_string();
+        assert!(error.contains("upstreams[0]"), "{error}");
+        // Default ports count: http://127.0.0.1 is port 80.
+        let portless = format!(
+            "[metrics]\nenabled = true\nlisten = '127.0.0.1:80'\n{}",
+            config_with_upstream("http://127.0.0.1")
+        );
+        assert!(Config::parse(&portless).is_err());
     }
 }

@@ -26,6 +26,16 @@ trusted_proxies = []
 # X-Forwarded-For instead.
 cloudflare_ranges = []
 
+# Operational metrics (plan section 8): a second listener serving
+# Prometheus-text counters on GET /metrics. Loopback only — a
+# non-loopback listen address is a config error, hostnames do not
+# resolve here, and the proxy refuses to dial the listener, so a route
+# or tunnel can never publish /metrics. Scrapes are not counted as
+# requests. Off by default.
+# [metrics]
+# enabled = false
+# listen = "127.0.0.1:9188"
+
 [[sites]]
 hosts = ["example.com"]
 

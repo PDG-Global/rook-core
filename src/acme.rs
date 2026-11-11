@@ -398,9 +398,13 @@ pub async fn run_site(
                 ) => result,
             };
             match result {
-                Ok(()) => failures = 0,
+                Ok(()) => {
+                    failures = 0;
+                    state.metrics.acme_renewal(true);
+                }
                 Err(error) => {
                     failures = failures.saturating_add(1);
+                    state.metrics.acme_renewal(false);
                     next_check = retry_delay(failures);
                     warn!(
                         hosts = ?site.hosts,
