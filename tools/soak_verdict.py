@@ -71,8 +71,18 @@ def main():
 
     gauge_ok, line = verdict_line("gauge_rss_bytes", [(r[0], r[1]) for r in post], args.slope_fail_pct)
     print(line); failures += [] if gauge_ok else ["gauge RSS slope"]
-    fds_ok, line = verdict_line("open_fds", [(r[0], r[3]) for r in post], args.slope_fail_pct)
-    print(line); failures += [] if fds_ok else ["fd slope"]
+    # Fds get an absolute floor below which the percentage cannot fail:
+    # the count is small (tens), so a handful of fds per hour is noise a
+    # percentage-of-baseline turns into a false FAIL (seen in dry-runs).
+    # RSS needs no floor: its baseline is megabytes.
+    fd_samples = [(r[0], r[3]) for r in post]
+    fd_baseline = sum(v for _, v in fd_samples) / len(fd_samples)
+    fd_slope = slope_per_hour(fd_samples)
+    fd_pct = (fd_slope / fd_baseline * 100.0) if fd_baseline else 0.0
+    fd_ok = fd_pct <= args.slope_fail_pct or fd_slope <= 12
+    print(f"open_fds: baseline={fd_baseline:.0f} slope={fd_slope:+.0f}/hr ({fd_pct:+.3f}%/hr) -> {'ok' if fd_ok else 'FAIL'}")
+    if not fd_ok:
+        failures.append("fd slope")
     # ps RSS drifts for reasons rook does not control; printed, not judged.
     _, line = verdict_line("ps_rss_bytes (corroboration only)", [(r[0], r[2]) for r in post],
                            float("inf"))

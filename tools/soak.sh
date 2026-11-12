@@ -20,7 +20,10 @@
 #     recorded — GOAWAY(ENHANCE_YOUR_CALM) and a bare close are different
 #     answers, and a change between runs is a behaviour change — along with the
 #     RSS delta across the burst and the seconds until normal throughput
-#     recovers.
+#     recovers. On-box bursts are labelled path=on-box and count as LIMITER
+#     coverage: from 127.0.0.1 the per-IP rate/connection limits answer before
+#     hyper's rapid-reset classifier does, so the classification evidence
+#     (GOAWAY vs close) comes from the remote phase, not from this script.
 #
 # The load generator runs on the same box as rookd by design. That would
 # poison a benchmark (the generator competes for CPU); a soak watches rook's
@@ -93,7 +96,9 @@ start_h1() {
         i=0
         urls=""
         while [ $i -lt 50 ]; do
-            urls="$urls --resolve $HOST:443:127.0.0.1 https://$HOST/"
+            # -o is per-URL in curl: without one per URL, every body but
+            # the first lands on stdout.
+            urls="$urls -o /dev/null --resolve $HOST:443:127.0.0.1 https://$HOST/"
             i=$((i + 1))
         done
         # shellcheck disable=SC2086
@@ -144,7 +149,7 @@ sample() {
     ts=$(date -u +%s)
     rookd_pid=$(pgrep rookd | head -1)
     gauge=$(curl -s --max-time 5 "$METRICS" \
-        | awk '/^rook_memory_resident_bytes/ {print $2}' || true)
+        | awk '/^rook_process_resident_memory_bytes/ {print $2}' || true)
     ps_rss=$(ps -o rss= -p "$rookd_pid" 2>/dev/null | awk '{s+=$1} END {print s*1024}' || true)
     fds=$(procstat -f "$rookd_pid" 2>/dev/null | tail -n +3 | wc -l | tr -d ' ' || true)
     conns=$(curl -s --max-time 5 "$METRICS" \
@@ -159,7 +164,7 @@ run_burst() { # mode
     say "burst start: $mode"
     rss_before=$(awk -F, 'END {print $2}' "$SAMPLES")
     out=$(python3 "$HERE/soak_burst.py" --host "$HOST" --port 443 --mode "$mode" 2>&1) || true
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $mode $out" >> "$BURSTS"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode $out" >> "$BURSTS"
     say "burst done: $mode $out"
     # Recovery probe: seconds until a normal request succeeds again,
     # capped at 60s. A server that survives the burst but takes a minute
@@ -176,7 +181,7 @@ run_burst() { # mode
     sleep 5
     sample
     rss_after=$(awk -F, 'END {print $2}' "$SAMPLES")
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $mode recovery_seconds=$recovery rss_before=$rss_before rss_after=$rss_after" \
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode recovery_seconds=$recovery rss_before=$rss_before rss_after=$rss_after" \
         >> "$BURSTS"
     say "burst recovery: $mode ${recovery}s rss $rss_before -> $rss_after"
 }

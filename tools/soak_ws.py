@@ -64,6 +64,30 @@ def recv_frame(sock):
     return opcode, payload
 
 
+def send_pong(sock, payload):
+    # Control-frame reply to a server ping; masked like any client frame.
+    mask = os.urandom(4)
+    header = struct.pack("!BB", 0x8A, 0x80 | len(payload))
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    sock.sendall(header + mask + masked)
+
+
+def recv_echo(sock):
+    """Read until the echoed text frame, answering control frames."""
+    while True:
+        opcode, payload = recv_frame(sock)
+        if opcode == 0x8:
+            return None  # close
+        if opcode == 0x9:
+            send_pong(sock, payload)  # ping -> pong
+            continue
+        if opcode == 0xA:
+            continue  # pong
+        if opcode != 0x1:
+            raise ConnectionError(f"unexpected opcode {opcode}")
+        return payload
+
+
 def handshake(sock, host, path):
     key = base64.b64encode(os.urandom(16)).decode()
     request = (
@@ -95,12 +119,9 @@ def run_session(host, port, path, interval, deadline, dial):
         echoes = 0
         while time.time() < deadline:
             send_text(sock, "soak")
-            opcode, _ = recv_frame(sock)
-            if opcode == 0x8:
+            if recv_echo(sock) is None:
                 log("closed by peer (clean rotation)")
                 return echoes
-            if opcode != 0x1:
-                raise ConnectionError(f"unexpected opcode {opcode}")
             echoes += 1
             time.sleep(interval)
         return echoes
