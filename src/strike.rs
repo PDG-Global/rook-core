@@ -133,6 +133,10 @@ struct Inner {
     /// operator allowlist **plus the trusted-proxy ranges** — a proxy in
     /// front of a site must never ban itself and take the site down.
     exempt: Vec<IpNet>,
+    /// Who this tracker protects (a site's first host, or "global").
+    /// Carried so every log line names its scope; operator-supplied,
+    /// bounded by the configuration, never request-derived.
+    scope: String,
     state: Mutex<State>,
     metrics: Mutex<StrikeMetrics>,
 }
@@ -169,6 +173,7 @@ impl StrikeTracker {
         max_tracked: usize,
         idle_expiry: Duration,
         exempt: Vec<IpNet>,
+        scope: String,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -176,6 +181,7 @@ impl StrikeTracker {
                 max_tracked,
                 idle_expiry,
                 exempt,
+                scope,
                 state: Mutex::new(State::default()),
                 metrics: Mutex::new(StrikeMetrics::default()),
             }),
@@ -202,6 +208,13 @@ impl StrikeTracker {
             Some(until) if until > now => {
                 c.last_seen = now;
                 lock_recover(&self.inner.metrics).rejected += 1;
+                // Debug, not warn: a banned client retries at its own
+                // rate, and that rate must not become a log flood.
+                tracing::debug!(
+                    scope = %self.inner.scope,
+                    client = %ip,
+                    "request dropped: client is banned"
+                );
                 true
             }
             Some(_) => {
@@ -216,6 +229,11 @@ impl StrikeTracker {
     }
 
     /// Records a strike. Returns what it did.
+    ///
+    /// Logging policy: threshold crossings are warnings exactly once per
+    /// client per window (the fresh crossing); everything else is debug.
+    /// An attacker controls the strike rate, so per-strike warnings
+    /// would let them flood the log.
     pub fn strike(&self, ip: IpAddr, reason: StrikeReason) -> StrikeOutcome {
         if !self.inner.rules.enabled || self.is_exempt(&ip) {
             return StrikeOutcome::Noted;
@@ -248,6 +266,12 @@ impl StrikeTracker {
                 st.clients.remove(&oldest);
             } else {
                 // Everyone tracked is banned; drop the strike.
+                tracing::debug!(
+                    scope = %self.inner.scope,
+                    client = %ip,
+                    reason = reason.as_str(),
+                    "strike dropped: every tracked client is banned"
+                );
                 return StrikeOutcome::Noted;
             }
         }
@@ -258,6 +282,12 @@ impl StrikeTracker {
         });
         c.last_seen = now;
         if c.banned_until.is_some_and(|u| u > now) {
+            tracing::debug!(
+                scope = %self.inner.scope,
+                client = %ip,
+                reason = reason.as_str(),
+                "strike from an already-banned client"
+            );
             return StrikeOutcome::Banned; // already banned; keep counting
         }
         c.strikes
@@ -265,19 +295,54 @@ impl StrikeTracker {
         // Only the count matters, so the vec never grows past the
         // threshold: in log-only mode nothing else bounds it, and an
         // attacker must not turn the defence into memory exhaustion.
-        if c.strikes.len() < rules.threshold as usize {
+        let below_threshold = c.strikes.len() < rules.threshold as usize;
+        if below_threshold {
             c.strikes.push((now, reason));
         }
         if (c.strikes.len() as u32) < rules.threshold {
+            tracing::debug!(
+                scope = %self.inner.scope,
+                client = %ip,
+                reason = reason.as_str(),
+                strikes = c.strikes.len(),
+                "strike recorded"
+            );
             return StrikeOutcome::Noted;
         }
+        // The crossing is fresh only when this strike is the one that
+        // reached the threshold; repeat strikes past it stay at debug.
+        let fresh_crossing = below_threshold && c.strikes.len() as u32 == rules.threshold;
         if rules.log_only {
             lock_recover(&self.inner.metrics).would_ban += 1;
+            if fresh_crossing {
+                tracing::warn!(
+                    scope = %self.inner.scope,
+                    client = %ip,
+                    reason = reason.as_str(),
+                    threshold = rules.threshold,
+                    "strike threshold crossed; client would be banned (log-only)"
+                );
+            } else {
+                tracing::debug!(
+                    scope = %self.inner.scope,
+                    client = %ip,
+                    reason = reason.as_str(),
+                    "strike past the threshold; client would be banned (log-only)"
+                );
+            }
             return StrikeOutcome::WouldBan;
         }
         c.banned_until = Some(now + rules.ban_for);
         c.strikes.clear();
         lock_recover(&self.inner.metrics).bans += 1;
+        tracing::warn!(
+            scope = %self.inner.scope,
+            client = %ip,
+            reason = reason.as_str(),
+            threshold = rules.threshold,
+            ban_secs = rules.ban_for.as_secs(),
+            "strike threshold crossed; client banned"
+        );
         StrikeOutcome::Banned
     }
 
@@ -307,6 +372,7 @@ mod tests {
             8,
             Duration::from_secs(60),
             Vec::new(),
+            "test".to_owned(),
         );
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         for _ in 0..10_000 {

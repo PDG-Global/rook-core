@@ -38,6 +38,10 @@ cloudflare_ranges = []
 
 [[sites]]
 hosts = ["example.com"]
+# Upstream response headers that would normally be stripped because
+# they disclose the backend ("server", "x-powered-by"). List one here
+# only when the app legitimately surfaces its own. Default: strip all.
+# preserve_upstream_headers = []
 
 [[sites.routes]]
 prefix = "/"

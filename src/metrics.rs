@@ -420,6 +420,7 @@ mod tests {
             8,
             std::time::Duration::from_secs(60),
             Vec::new(),
+            "example.com".to_owned(),
         );
         metrics.register_strikes("example.com".to_owned(), tracker.clone());
         tracker.strike(

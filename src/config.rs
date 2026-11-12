@@ -98,6 +98,10 @@ pub struct SiteConfig {
     pub tls_key: Option<PathBuf>,
     pub routes: Vec<RouteConfig>,
     pub strikes: StrikeRulesConfig,
+    /// Upstream response headers that may keep their disclosure value
+    /// (validated against [`crate::proxy::DISCLOSURE_HEADERS`]). Empty
+    /// strips them all, which is the default.
+    pub preserve_upstream_headers: Vec<String>,
 }
 
 /// Per-site strike/ban rules (plan §6). `None` disables the tracker for
@@ -294,6 +298,7 @@ struct RawSiteConfig {
     tls_key: Option<String>,
     routes: Vec<RawRouteConfig>,
     strikes: Option<RawStrikeRulesConfig>,
+    preserve_upstream_headers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -493,6 +498,15 @@ fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
                 return Err(validation(
                     "server.strikes".to_string(),
                     "window_secs and ban_secs must be non-zero",
+                ));
+            }
+            // Trap paths are matched against a request's site, so they
+            // can only live on a site. Accepting them here would
+            // silently do nothing, which reads as wired for months.
+            if !raw_strikes.trap_paths.is_empty() {
+                return Err(validation(
+                    "server.strikes.trap_paths".to_string(),
+                    "trap paths are per-site; move them to [[sites]].strikes.trap_paths",
                 ));
             }
             StrikeRulesConfig {
@@ -766,6 +780,24 @@ fn parse_site(
         None => StrikeRulesConfig::default(),
     };
 
+    let mut preserve_upstream_headers = Vec::with_capacity(raw.preserve_upstream_headers.len());
+    for (i, name) in raw.preserve_upstream_headers.iter().enumerate() {
+        // The list exists to exempt a header from the disclosure strip,
+        // so an entry that names anything else is a config mistake the
+        // operator should hear about, not a no-op to store.
+        let lowered = name.to_ascii_lowercase();
+        if !crate::proxy::DISCLOSURE_HEADERS.contains(&lowered.as_str()) {
+            return Err(validation(
+                format!("sites[{site_index}].preserve_upstream_headers[{i}]"),
+                format!(
+                    "{name:?} is not a stripped upstream header; expected one of: {}",
+                    crate::proxy::DISCLOSURE_HEADERS.join(", ")
+                ),
+            ));
+        }
+        preserve_upstream_headers.push(lowered);
+    }
+
     Ok(SiteConfig {
         acme,
         hosts,
@@ -773,6 +805,7 @@ fn parse_site(
         tls_key,
         routes,
         strikes,
+        preserve_upstream_headers,
     })
 }
 
@@ -1319,6 +1352,57 @@ upstreams = ["http://127.0.0.1"]
         let error = Config::parse(input).unwrap_err().to_string();
         assert!(error.contains("sites[1].hosts[0]"), "{error}");
         assert!(error.contains("duplicate host"), "{error}");
+    }
+
+    #[test]
+    fn rejects_preserve_upstream_headers_outside_the_disclosure_list() {
+        let input = r#"
+[[sites]]
+hosts = ["example.com"]
+preserve_upstream_headers = ["x-forwarded-for"]
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:8080"]
+"#;
+        let error = Config::parse(input).unwrap_err().to_string();
+        assert!(
+            error.contains("sites[0].preserve_upstream_headers[0]"),
+            "{error}"
+        );
+        assert!(error.contains("server"), "{error}");
+    }
+
+    #[test]
+    fn accepts_preserve_upstream_headers_case_insensitively() {
+        let input = r#"
+[[sites]]
+hosts = ["example.com"]
+preserve_upstream_headers = ["Server"]
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:8080"]
+"#;
+        let config = Config::parse(input).unwrap();
+        assert_eq!(config.sites[0].preserve_upstream_headers, ["server"]);
+    }
+
+    #[test]
+    fn rejects_trap_paths_under_server_strikes() {
+        let input = r#"
+[server.strikes]
+enabled = true
+threshold = 5
+trap_paths = ["/wp-admin"]
+
+[[sites]]
+hosts = ["example.com"]
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:8080"]
+"#;
+        let error = Config::parse(input).unwrap_err().to_string();
+        assert!(error.contains("server.strikes.trap_paths"), "{error}");
+        assert!(error.contains("[[sites]].strikes"), "{error}");
     }
 
     #[test]

@@ -251,7 +251,7 @@ websocket_max_lifetime = 3601
 shutdown_drain = 16
 trusted_proxies = ["10.0.0.0/8", "2001:db8::/32"]
 cloudflare_ranges = ["203.0.113.0/24"]
-strikes = { enabled = true, log_only = true, threshold = 5, window_secs = 600, ban_secs = 3600, trap_paths = ["/wp-admin"] }
+strikes = { enabled = true, log_only = true, threshold = 5, window_secs = 600, ban_secs = 3600 }
 strike_allowlist = ["192.0.2.10/32"]
 
 [metrics]
@@ -260,6 +260,7 @@ listen = "127.0.0.1:9188"
 
 [[sites]]
 hosts = ["example.com", "www.example.com"]
+strikes = { enabled = true, log_only = true, threshold = 5, window_secs = 600, ban_secs = 3600, trap_paths = ["/wp-admin"] }
 
 [sites.acme]
 contact = "mailto:ops@example.com"
