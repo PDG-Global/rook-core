@@ -98,6 +98,10 @@ pub struct SiteConfig {
     pub tls_key: Option<PathBuf>,
     pub routes: Vec<RouteConfig>,
     pub strikes: StrikeRulesConfig,
+    /// Upstream response headers that may keep their disclosure value
+    /// (validated against [`crate::proxy::DISCLOSURE_HEADERS`]). Empty
+    /// strips them all, which is the default.
+    pub preserve_upstream_headers: Vec<String>,
 }
 
 /// Per-site strike/ban rules (plan §6). `None` disables the tracker for
@@ -294,6 +298,7 @@ struct RawSiteConfig {
     tls_key: Option<String>,
     routes: Vec<RawRouteConfig>,
     strikes: Option<RawStrikeRulesConfig>,
+    preserve_upstream_headers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -775,6 +780,24 @@ fn parse_site(
         None => StrikeRulesConfig::default(),
     };
 
+    let mut preserve_upstream_headers = Vec::with_capacity(raw.preserve_upstream_headers.len());
+    for (i, name) in raw.preserve_upstream_headers.iter().enumerate() {
+        // The list exists to exempt a header from the disclosure strip,
+        // so an entry that names anything else is a config mistake the
+        // operator should hear about, not a no-op to store.
+        let lowered = name.to_ascii_lowercase();
+        if !crate::proxy::DISCLOSURE_HEADERS.contains(&lowered.as_str()) {
+            return Err(validation(
+                format!("sites[{site_index}].preserve_upstream_headers[{i}]"),
+                format!(
+                    "{name:?} is not a stripped upstream header; expected one of: {}",
+                    crate::proxy::DISCLOSURE_HEADERS.join(", ")
+                ),
+            ));
+        }
+        preserve_upstream_headers.push(lowered);
+    }
+
     Ok(SiteConfig {
         acme,
         hosts,
@@ -782,6 +805,7 @@ fn parse_site(
         tls_key,
         routes,
         strikes,
+        preserve_upstream_headers,
     })
 }
 
@@ -1328,6 +1352,38 @@ upstreams = ["http://127.0.0.1"]
         let error = Config::parse(input).unwrap_err().to_string();
         assert!(error.contains("sites[1].hosts[0]"), "{error}");
         assert!(error.contains("duplicate host"), "{error}");
+    }
+
+    #[test]
+    fn rejects_preserve_upstream_headers_outside_the_disclosure_list() {
+        let input = r#"
+[[sites]]
+hosts = ["example.com"]
+preserve_upstream_headers = ["x-forwarded-for"]
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:8080"]
+"#;
+        let error = Config::parse(input).unwrap_err().to_string();
+        assert!(
+            error.contains("sites[0].preserve_upstream_headers[0]"),
+            "{error}"
+        );
+        assert!(error.contains("server"), "{error}");
+    }
+
+    #[test]
+    fn accepts_preserve_upstream_headers_case_insensitively() {
+        let input = r#"
+[[sites]]
+hosts = ["example.com"]
+preserve_upstream_headers = ["Server"]
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:8080"]
+"#;
+        let config = Config::parse(input).unwrap();
+        assert_eq!(config.sites[0].preserve_upstream_headers, ["server"]);
     }
 
     #[test]

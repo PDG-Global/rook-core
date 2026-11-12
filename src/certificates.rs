@@ -595,6 +595,7 @@ PBU0gcD3kQT2VvHSYVcBmgMTfj5wcNOajJLtTQfhA5bdHDnZ2u5586JTMyuM7va5\n\
             tls_key: Some(paths.1.clone()),
             routes: vec![],
             strikes: crate::config::StrikeRulesConfig::default(),
+            preserve_upstream_headers: vec![],
         }
     }
 
@@ -641,6 +642,7 @@ PBU0gcD3kQT2VvHSYVcBmgMTfj5wcNOajJLtTQfhA5bdHDnZ2u5586JTMyuM7va5\n\
             tls_key: None,
             strikes: crate::config::StrikeRulesConfig::default(),
             routes: vec![],
+            preserve_upstream_headers: vec![],
         };
         let certificate_path = directory.path().join("example.com/current/cert.pem");
         let key_path = directory.path().join("example.com/current/key.pem");

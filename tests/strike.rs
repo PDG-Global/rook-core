@@ -11,7 +11,13 @@ fn ip(n: u8) -> IpAddr {
 }
 
 fn tracker(rules: StrikeRules) -> StrikeTracker {
-    StrikeTracker::new(rules, 8, Duration::from_secs(60), Vec::new(), "test".to_owned())
+    StrikeTracker::new(
+        rules,
+        8,
+        Duration::from_secs(60),
+        Vec::new(),
+        "test".to_owned(),
+    )
 }
 
 #[test]

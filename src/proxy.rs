@@ -135,6 +135,15 @@ const HOP_BY_HOP: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+/// Upstream response headers stripped because they disclose what runs
+/// behind the proxy — a scanner reads the backend's name and version
+/// straight off our TLS endpoint. A separate concept from `HOP_BY_HOP`:
+/// those must not be forwarded because of framing semantics, these
+/// forward fine and are removed for disclosure, which is why the list
+/// is named its own thing. A site can opt back in per header with
+/// `preserve_upstream_headers` (an app that legitimately surfaces its
+/// own `Server`).
+pub const DISCLOSURE_HEADERS: &[&str] = &["server", "x-powered-by"];
 const FORWARDED: &[&str] = &[
     "forwarded",
     "x-original-url",
@@ -175,6 +184,8 @@ struct Site {
     strikes: Option<crate::strike::StrikeTracker>,
     /// Normalized trap paths (a set, so the hot path is one lookup).
     trap_paths: std::collections::HashSet<String>,
+    /// Disclosure headers this site chose to keep (config-validated).
+    preserve_upstream: Arc<[http::HeaderName]>,
 }
 
 struct Route {
@@ -198,6 +209,7 @@ struct WebSocketUpgrade {
     activity: Option<ActivityGuard>,
     upload_tracker: UploadTracker,
     upstream_wait: Option<UpstreamWaitGuard>,
+    preserve_upstream: Arc<[http::HeaderName]>,
 }
 
 struct RequestPreparation {
@@ -276,6 +288,13 @@ impl AppState {
                 redirect_https: config.server.https_listen.is_some(),
                 strikes,
                 trap_paths: site_config.strikes.trap_paths.iter().cloned().collect(),
+                preserve_upstream: site_config
+                    .preserve_upstream_headers
+                    .iter()
+                    // Config validation restricts entries to known header
+                    // names, so this parse cannot fail.
+                    .map(|name| http::HeaderName::from_bytes(name.as_bytes()).unwrap())
+                    .collect(),
             });
             for host in &site_config.hosts {
                 sites.insert(host.clone(), Arc::clone(&site));
@@ -555,6 +574,9 @@ impl AppState {
             },
         )?;
 
+        // End the borrow of `self` (site, route) before the branches
+        // below move the `Arc<Self>` receiver.
+        let preserve_upstream = site.preserve_upstream.clone();
         if upgrade {
             self.proxy_websocket(WebSocketUpgrade {
                 request,
@@ -566,11 +588,19 @@ impl AppState {
                 activity,
                 upload_tracker: upload_tracker.clone(),
                 upstream_wait,
+                preserve_upstream,
             })
             .await
         } else {
-            self.proxy_http(request, permits, activity, upload_tracker, upstream_wait)
-                .await
+            self.proxy_http(
+                request,
+                permits,
+                activity,
+                upload_tracker,
+                upstream_wait,
+                preserve_upstream,
+            )
+            .await
         }
     }
 
@@ -603,6 +633,7 @@ impl AppState {
         activity: Option<ActivityGuard>,
         upload_tracker: UploadTracker,
         upstream_wait: Option<UpstreamWaitGuard>,
+        preserve_upstream: Arc<[http::HeaderName]>,
     ) -> ProxyResult {
         let _upstream_wait = upstream_wait;
         let started = std::time::Instant::now();
@@ -623,6 +654,7 @@ impl AppState {
             self.config.server.idle_timeout,
             Some(permits),
             activity,
+            &preserve_upstream,
         ))
     }
 
@@ -637,6 +669,7 @@ impl AppState {
             activity,
             upload_tracker,
             upstream_wait,
+            preserve_upstream,
         } = upgrade;
         let _upstream_wait = upstream_wait;
         let authority = base.authority().ok_or(ProxyError::BadGateway)?.clone();
@@ -738,6 +771,7 @@ impl AppState {
                 self.config.server.idle_timeout,
                 Some(upstream_permits),
                 activity,
+                &preserve_upstream,
             ));
         }
         if !valid_websocket_upgrade(response.headers(), &websocket_key) {
@@ -770,7 +804,7 @@ impl AppState {
             }
             connection_task.abort();
         });
-        Ok(map_response(response, idle, None, None))
+        Ok(map_response(response, idle, None, None, &preserve_upstream))
     }
 
     pub fn shutdown(&self) {
@@ -1232,8 +1266,17 @@ fn map_response(
     idle: Duration,
     upstream_permits: Option<UpstreamPermits>,
     activity: Option<ActivityGuard>,
+    preserve_upstream: &[http::HeaderName],
 ) -> Response<ResponseBody> {
     let (mut parts, body) = response.into_parts();
+    // Disclosure headers come off every response, including a 101: they
+    // are not framing, so the switching-protocols exception below does
+    // not cover them. A site only keeps the ones it explicitly named.
+    for name in DISCLOSURE_HEADERS {
+        if !preserve_upstream.iter().any(|keep| keep.as_str() == *name) {
+            parts.headers.remove(*name);
+        }
+    }
     if parts.status != StatusCode::SWITCHING_PROTOCOLS {
         let mut connection_headers = Vec::new();
         for value in parts.headers.get_all(CONNECTION) {

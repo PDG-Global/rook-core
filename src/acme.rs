@@ -780,6 +780,7 @@ PBU0gcD3kQT2VvHSYVcBmgMTfj5wcNOajJLtTQfhA5bdHDnZ2u5586JTMyuM7va5\n\
             tls_key: None,
             routes: Vec::new(),
             strikes: crate::config::StrikeRulesConfig::default(),
+            preserve_upstream_headers: Vec::new(),
         }
     }
 

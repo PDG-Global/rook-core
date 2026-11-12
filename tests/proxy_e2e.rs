@@ -129,6 +129,16 @@ fn rook_config(
     server_settings: &str,
     route_settings: &str,
 ) -> String {
+    rook_config_site(addr, upstreams, server_settings, "", route_settings)
+}
+
+fn rook_config_site(
+    addr: SocketAddr,
+    upstreams: &[SocketAddr],
+    server_settings: &str,
+    site_settings: &str,
+    route_settings: &str,
+) -> String {
     let upstreams = upstreams
         .iter()
         .map(|addr| format!("\"http://{addr}\""))
@@ -161,6 +171,7 @@ shutdown_drain = 1
 
 [[sites]]
 hosts = ["example.com"]
+{site_settings}
 
 [[sites.routes]]
 prefix = "/"
@@ -175,9 +186,24 @@ async fn spawn_rook(
     server_settings: &str,
     route_settings: &str,
 ) -> RookServer {
+    spawn_rook_site(upstreams, server_settings, "", route_settings).await
+}
+
+async fn spawn_rook_site(
+    upstreams: &[SocketAddr],
+    server_settings: &str,
+    site_settings: &str,
+    route_settings: &str,
+) -> RookServer {
     for _ in 0..5 {
         let addr = free_addr().await;
-        let input = rook_config(addr, upstreams, server_settings, route_settings);
+        let input = rook_config_site(
+            addr,
+            upstreams,
+            server_settings,
+            site_settings,
+            route_settings,
+        );
         let config = Config::parse(&input).unwrap();
         let task = tokio::spawn(async move {
             server::run(config).await.unwrap();
@@ -991,6 +1017,42 @@ async fn forwards_normalized_path_original_query_host_and_direct_client_ip() {
     assert_eq!(request.header_values("x-real-ip"), ["127.0.0.1"]);
     assert_eq!(request.header_values("x-forwarded-for"), ["127.0.0.1"]);
     assert_eq!(request.header_values("x-forwarded-proto"), ["http"]);
+}
+
+#[tokio::test]
+async fn strips_upstream_disclosure_headers_by_default() {
+    let (upstream, _request_rx, _upstream_task) = spawn_capture_upstream(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nServer: SimpleHTTP/0.6 Python/3.12.15\r\nX-Powered-By: PHP/8.1\r\nX-Upstream: kept\r\nConnection: close\r\n\r\nok".to_owned(),
+    )
+    .await;
+    let rook = spawn_rook(&[upstream], "", "").await;
+    let response = send_request(rook.addr, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"ok");
+    assert_eq!(response.header("server"), None);
+    assert_eq!(response.header("x-powered-by"), None);
+    // An ordinary upstream header is not disclosure: it survives.
+    assert_eq!(response.header("x-upstream"), Some("kept"));
+}
+
+#[tokio::test]
+async fn preserve_upstream_headers_keeps_only_the_named_headers() {
+    let (upstream, _request_rx, _upstream_task) = spawn_capture_upstream(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nServer: my-app/1.0\r\nX-Powered-By: PHP/8.1\r\nConnection: close\r\n\r\nok".to_owned(),
+    )
+    .await;
+    let rook = spawn_rook_site(
+        &[upstream],
+        "",
+        "preserve_upstream_headers = [\"server\"]",
+        "",
+    )
+    .await;
+    let response = send_request(rook.addr, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("server"), Some("my-app/1.0"));
+    // The opt-out names headers one by one: x-powered-by still strips.
+    assert_eq!(response.header("x-powered-by"), None);
 }
 
 #[tokio::test]
