@@ -73,7 +73,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-awk 'BEGIN{ s=""; while (length(s) < 1024) s = s "x"; print s }' > "$WORK/index.html"
+# Only the payload lives in the served root: the work directory also holds
+# rookd.toml, the Caddyfiles and the upstream log, and a proxy that forwards
+# /rookd.toml would serve them.
+mkdir -p "$WORK/www"
+awk 'BEGIN{ s=""; while (length(s) < 1024) s = s "x"; print s }' > "$WORK/www/index.html"
 
 # The upstream counts what it serves. That is how the gate knows whether a
 # request reached the origin rather than being rejected in front of it.
@@ -83,7 +87,7 @@ cat > "$WORK/upstream.Caddyfile" <<EOF
 	auto_https off
 }
 http://127.0.0.1:9000 {
-	root * $WORK
+	root * $WORK/www
 	file_server
 	log {
 		output file $UP_LOG
@@ -92,16 +96,18 @@ http://127.0.0.1:9000 {
 }
 EOF
 
-cat > "$WORK/proxy.Caddyfile" <<'EOF'
+cat > "$WORK/proxy.Caddyfile" <<EOF
 {
 	admin off
 	auto_https off
 	log off
 }
 http://:8081 {
+	bind BINDDIRECTIVE
 	reverse_proxy 127.0.0.1:9000
 }
 EOF
+sed -i.bak "s#BINDDIRECTIVE#$BIND#" "$WORK/proxy.Caddyfile" && rm -f "$WORK/proxy.Caddyfile.bak"
 
 # Rate and connection limits lifted: measuring a rate limiter is not
 # measuring a proxy, and rook's defaults are deliberately conservative.
