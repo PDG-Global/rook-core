@@ -38,7 +38,11 @@ def verdict_line(name, samples, fail_pct):
     # understates the growth a reader thinks the percentage reports.
     baseline = samples[0][1]
     slope = slope_per_hour(samples)
-    pct = (slope / baseline * 100.0) if baseline else 0.0
+    # A zero baseline makes any percentage 0 and silently passes, which
+    # almost always means the metric was never read — INVALID, not ok.
+    if baseline == 0:
+        return False, f"{name}: baseline=0 (metric never read?) -> INVALID"
+    pct = slope / baseline * 100.0
     ok = pct <= fail_pct
     return ok, f"{name}: baseline={baseline:.0f} slope={slope:+.0f}/hr ({pct:+.3f}%/hr) -> {'ok' if ok else 'FAIL'}"
 
@@ -83,12 +87,16 @@ def main():
     fd_samples = [(r[0], r[3]) for r in post]
     fd_baseline = fd_samples[0][1]
     fd_slope = slope_per_hour(fd_samples)
-    fd_pct = (fd_slope / fd_baseline * 100.0) if fd_baseline else 0.0
     fd_growth = fd_samples[-1][1] - fd_baseline
-    fd_ok = (fd_pct <= args.slope_fail_pct or fd_slope <= 3) and fd_growth <= 50
-    print(f"open_fds: baseline={fd_baseline:.0f} slope={fd_slope:+.0f}/hr ({fd_pct:+.3f}%/hr) growth={fd_growth:+.0f} -> {'ok' if fd_ok else 'FAIL'}")
-    if not fd_ok:
-        failures.append("fd slope")
+    if fd_baseline == 0:
+        print("open_fds: baseline=0 (metric never read?) -> INVALID")
+        failures.append("fd baseline zero")
+    else:
+        fd_pct = fd_slope / fd_baseline * 100.0
+        fd_ok = (fd_pct <= args.slope_fail_pct or fd_slope <= 3) and fd_growth <= 50
+        print(f"open_fds: baseline={fd_baseline:.0f} slope={fd_slope:+.0f}/hr ({fd_pct:+.3f}%/hr) growth={fd_growth:+.0f} -> {'ok' if fd_ok else 'FAIL'}")
+        if not fd_ok:
+            failures.append("fd slope")
     # ps RSS drifts for reasons rook does not control; printed, not judged.
     _, line = verdict_line("ps_rss_bytes (corroboration only)", [(r[0], r[2]) for r in post],
                            float("inf"))
