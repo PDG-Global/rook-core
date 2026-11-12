@@ -11,7 +11,7 @@ fn ip(n: u8) -> IpAddr {
 }
 
 fn tracker(rules: StrikeRules) -> StrikeTracker {
-    StrikeTracker::new(rules, 8, Duration::from_secs(60), Vec::new())
+    StrikeTracker::new(rules, 8, Duration::from_secs(60), Vec::new(), "test".to_owned())
 }
 
 #[test]
@@ -106,6 +106,7 @@ fn exempt_ranges_are_never_struck_or_banned() {
         8,
         Duration::from_secs(60),
         exempt,
+        "test".to_owned(),
     );
     assert_eq!(
         t.strike(ip(1), StrikeReason::MalformedRequest),

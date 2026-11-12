@@ -257,18 +257,18 @@ impl AppState {
                 .collect();
             routes.sort_by_key(|route| std::cmp::Reverse(route.config.prefix.len()));
             let strikes = site_config.strikes.enabled.then(|| {
+                // The scope label is the site's first configured host:
+                // operator-supplied, bounded by the configuration, and
+                // never request-derived. Metrics and log lines share it.
+                let scope = site_config.hosts.first().cloned().unwrap_or_default();
                 let tracker = crate::strike::StrikeTracker::new(
                     crate::strike::StrikeRules::from(&site_config.strikes),
                     config.server.max_tracked_clients,
                     std::time::Duration::from_secs(300),
                     strike_exempt.clone(),
+                    scope.clone(),
                 );
-                // The scope label is the site's first configured host:
-                // operator-supplied, bounded by the configuration, and
-                // never request-derived.
-                if let Some(host) = site_config.hosts.first() {
-                    metrics.register_strikes(host.clone(), tracker.clone());
-                }
+                metrics.register_strikes(scope, tracker.clone());
                 tracker
             });
             let site = Arc::new(Site {
@@ -294,6 +294,7 @@ impl AppState {
             config.server.max_tracked_clients,
             std::time::Duration::from_secs(300),
             strike_exempt,
+            "global".to_owned(),
         );
         metrics.register_strikes("global".to_owned(), strikes_global.clone());
         Arc::new(Self {
