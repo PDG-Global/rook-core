@@ -86,6 +86,7 @@ LOAD_PIDS=""
 stop_load() {
     for pid in $LOAD_PIDS; do kill "$pid" 2>/dev/null || true; done
     LOAD_PIDS=""
+    TRAP_PID=""   # cleared: a stale pid could name a reused process later
     wait 2>/dev/null || true
 }
 cleanup() { stop_load; }
@@ -132,14 +133,23 @@ start_ws() {
 }
 
 # Strike exercise: a slow trickle of trap-path hits keeps the strike path warm
-# without tripping the ban threshold in any window.
+# without tripping the ban threshold in any window. Tracked separately so a
+# burst can pause it: a trickle 404 lands in the same 4xx bucket the burst's
+# server-side delta reads, and the delta must be zero-or-burst-sized.
+TRAP_PID=""
 start_traps() {
     while :; do
         curl -s -o /dev/null --resolve "$HOST:443:127.0.0.1" \
             "https://$HOST/wp-admin" || true
         sleep 90
     done &
-    LOAD_PIDS="$LOAD_PIDS $!"
+    TRAP_PID=$!
+    LOAD_PIDS="$LOAD_PIDS $TRAP_PID"
+}
+
+stop_traps() {
+    [ -n "$TRAP_PID" ] && kill "$TRAP_PID" 2>/dev/null || true
+    TRAP_PID=""
 }
 
 start_load() {
@@ -174,10 +184,16 @@ responses_4xx() {
 run_burst() { # mode
     mode=$1
     say "burst start: $mode"
+    # Pause the trap trickle and let any in-flight hit land BEFORE the
+    # first counter read, so the delta across the burst is the burst's
+    # alone.
+    stop_traps
+    sleep 2
     rss_before=$(awk -F, 'END {print $2}' "$SAMPLES")
     r4_before=$(responses_4xx)
     out=$(python3 "$HERE/soak_burst.py" --host "$HOST" --port 443 --mode "$mode" 2>&1) || true
     r4_after=$(responses_4xx)
+    start_traps
     delta=$(( ${r4_after:-0} - ${r4_before:-0} ))
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode $out server_4xx_delta=$delta" >> "$BURSTS"
     say "burst done: $mode $out server_4xx_delta=$delta"
