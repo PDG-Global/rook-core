@@ -495,6 +495,15 @@ fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
                     "window_secs and ban_secs must be non-zero",
                 ));
             }
+            // Trap paths are matched against a request's site, so they
+            // can only live on a site. Accepting them here would
+            // silently do nothing, which reads as wired for months.
+            if !raw_strikes.trap_paths.is_empty() {
+                return Err(validation(
+                    "server.strikes.trap_paths".to_string(),
+                    "trap paths are per-site; move them to [[sites]].strikes.trap_paths",
+                ));
+            }
             StrikeRulesConfig {
                 enabled: raw_strikes.enabled,
                 log_only: raw_strikes.log_only,
@@ -1319,6 +1328,25 @@ upstreams = ["http://127.0.0.1"]
         let error = Config::parse(input).unwrap_err().to_string();
         assert!(error.contains("sites[1].hosts[0]"), "{error}");
         assert!(error.contains("duplicate host"), "{error}");
+    }
+
+    #[test]
+    fn rejects_trap_paths_under_server_strikes() {
+        let input = r#"
+[server.strikes]
+enabled = true
+threshold = 5
+trap_paths = ["/wp-admin"]
+
+[[sites]]
+hosts = ["example.com"]
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:8080"]
+"#;
+        let error = Config::parse(input).unwrap_err().to_string();
+        assert!(error.contains("server.strikes.trap_paths"), "{error}");
+        assert!(error.contains("[[sites]].strikes"), "{error}");
     }
 
     #[test]
