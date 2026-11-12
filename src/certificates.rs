@@ -369,6 +369,7 @@ fn load_certified_key(
             path: certificate_path.to_path_buf(),
         });
     }
+    let certificates = trim_roots_from_chain(certificates, certificate_path);
     validate_certificate_validity(&certificates[0], certificate_path)?;
 
     let private_key = read_private_key(key_path)?;
@@ -421,6 +422,45 @@ fn validate_certificate_validity(
 
 fn certificate_valid_at(not_before: i64, not_after: i64, now: i64) -> bool {
     not_before <= now && now <= not_after
+}
+
+/// Serve the leaf and its intermediates only. A self-signed root in the
+/// chain is dead weight on every handshake — a client that needs it
+/// already has it in its trust store, and one that does not will not
+/// trust it from us. The leaf itself is always kept, even self-signed:
+/// a supplied self-signed certificate is a legitimate single-cert
+/// chain. An unparseable entry is kept too — trimming only removes
+/// what it can positively identify, and a later validation pass owns
+/// rejecting bad input.
+///
+/// A cross-signed root (issuer != subject, but the key is a trust
+/// anchor elsewhere) is indistinguishable from an ordinary intermediate
+/// without a trust store, so it stays; that is the chain shape ACME
+/// servers send on purpose.
+fn trim_roots_from_chain(
+    certificates: Vec<CertificateDer<'static>>,
+    path: &Path,
+) -> Vec<CertificateDer<'static>> {
+    let before = certificates.len();
+    let trimmed = certificates
+        .into_iter()
+        .enumerate()
+        .filter(|(index, certificate)| {
+            *index == 0
+                || parse_x509_certificate(certificate.as_ref())
+                    .map(|(_, parsed)| parsed.issuer().as_raw() != parsed.subject().as_raw())
+                    .unwrap_or(true)
+        })
+        .map(|(_, certificate)| certificate)
+        .collect::<Vec<_>>();
+    if trimmed.len() < before {
+        tracing::info!(
+            certificate = %path.display(),
+            dropped = before - trimmed.len(),
+            "trimmed self-signed root certificates from the served chain"
+        );
+    }
+    trimmed
 }
 
 fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, CertificateError> {
@@ -572,6 +612,92 @@ rxo3y14YrK+Wxulyuu+UgHSxxZEzDHQj4ofYTYsCgYAyWRF3OEqyslNhJh8v0myp\n\
 /fW+GCoZvn5SRNqLgGUKrh/QYBtqC4eJxPeC9ctSa1y0Pg+qFdnvjlWqUX3KGjfk\n\
 PBU0gcD3kQT2VvHSYVcBmgMTfj5wcNOajJLtTQfhA5bdHDnZ2u5586JTMyuM7va5\n\
 43UPfow6ExGEf5hjYwyadA==\n\
+-----END PRIVATE KEY-----\n";
+
+    const CHAIN_LEAF: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIC4TCCAcmgAwIBAgIUU4Fzdkfus0apFnnm7xzrBfl8NJ4wDQYJKoZIhvcNAQEL\n\
+BQAwITEfMB0GA1UEAwwWUm9vayBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjExMTIw\n\
+MTAwMDVaGA8yMTI2MTAxOTAxMDAwNVowIDEeMBwGA1UEAwwVY2hhaW50ZXN0LmV4\n\
+YW1wbGUuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAywM2OvH8\n\
+R1ccYOgcDZBVigeyuMzjtwBTrhnmzCTZcrLnvQU7J4lsXKuNiMPgm1H9SF59R7Er\n\
+wkWGZYh0K/+UgxE+KYhSECcY+k7HXK55dAo5tqF2NHlfyVemaJ0PoOCJJ7k5j0/u\n\
+84gLg7j8Ge9+80XucdGrwcht6l2jdSZfpOxHCi30DQSHBXW9Vngq/gIKrN2s/MHa\n\
+cmnRrJ0F8pXOPZayomazeIHCrYDF3Okn9A7EPEqAf8ENyjziU4D5B8V4mvMoZy/t\n\
+GbbTsKqen1s/KbLMrH0NL0tLJfOTVdfW/981Mk31cYWkw4gvlfo6hOrIQv6xVjv4\n\
+k4Fmqdfz18y7RQIDAQABoxAwDjAMBgNVHRMBAf8EAjAAMA0GCSqGSIb3DQEBCwUA\n\
+A4IBAQBpAZYjRoz5ESZJqNXPw52Pm73VRgca7eBO7w5JXAq1SZ0aFOOMg7yNZJ4G\n\
+Xc52EyMUjnVqgxa3l3nIy2AaALCL3MnuuLj5alZhWftXeWA3Nq7KAvJD5hDDtfyC\n\
+RyEmQvE015nKpHJVTHubVJEAcZvoMdDmxfuZsukU98r4rtyGGvnAyowmYT5rkqcX\n\
+yEl8LqHg1UCcU+r/YJ+z/5mhgzt6ZM68Q5lG0y9WzxIyf7qnchNBe3Umf1H51Qym\n\
++KlR2L6XBbXxhfqEw/0E7vEkzVHPYVs2pdyKpDV39yP4doGCXUBTGj0UmytPtbge\n\
+Z+EJnjXa/IzFnvjcicMxmH2OIFZ9\n\
+-----END CERTIFICATE-----\n";
+
+    const CHAIN_INTERMEDIATE: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIC4DCCAcigAwIBAgIUfgLuj2bvohFslKhuBd81UKUOykkwDQYJKoZIhvcNAQEL\n\
+BQAwGTEXMBUGA1UEAwwOUm9vayBUZXN0IFJvb3QwIBcNMjYxMTEyMDEwMDA1WhgP\n\
+MjEyNjEwMTkwMTAwMDVaMCExHzAdBgNVBAMMFlJvb2sgVGVzdCBJbnRlcm1lZGlh\n\
+dGUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCpX8bZN4ClEiH/zSne\n\
+6RvXxxMJR6Cns3cGUnUDD7yA1Ce4cdupMmuAuWsa+dUbzXEaRcowlmYwbxW26IJR\n\
+6j7s+U1OORucCbUDr27fI85+36tMoiInI54rjRj0TfnJiHEFMeeJP80OEKzNoPmZ\n\
+krj4Vx3RaJGzol0kIu5LGlOwH1T3caNL37ehv0CvVlcYrj/JD6iMS32Z6EF9QqhA\n\
+P8W4w0k+D+kFGIzE4bvqA55ct2/gPXbc3FBCfFOdi5zPWe/+YJbNeguBB60iick4\n\
+QBtZ7o6ZQRb9eF9iQaMbyZ+H1aoI6V7ldblyzCE0nBtrsrzN5gqK8Gos/RrDa1i4\n\
+nV+BAgMBAAGjFjAUMBIGA1UdEwEB/wQIMAYBAf8CAQAwDQYJKoZIhvcNAQELBQAD\n\
+ggEBAF3wadyNB1+UXFXc6S8kvYlnukcOMS9T1lyQRJBa3frWBwm/jJXO5dJeSZSB\n\
+fhZVMNQuxQiwp41da3N0JHtLookW3h53bu/lCxu7LPWGJw8VY4+ExiLWbwYdNQIW\n\
+pjulMS243zduYMpAsQM5uTlXWiuvVSm02sXcWRHQ3dqztQZaXlsg+GA9J6XtycxJ\n\
+R9Pjef+EdnOcTQIMOzCpbSnHcnpW17SoBqb2Jicn6yHp596/05RaKC4Eph429Zpt\n\
+XDqugme2d5/xhtZj69D8iPu47R92PP3VP06JzJzLmBH9OaXdh1RGU/H/ZRulSCIv\n\
+pkrwDc4432W0Z11eEtlBMZ/aO2g=\n\
+-----END CERTIFICATE-----\n";
+
+    const CHAIN_ROOT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIC9DCCAdygAwIBAgIUG+Cqm9PWDbRJ4rlq146TyGPa7JswDQYJKoZIhvcNAQEL\n\
+BQAwGTEXMBUGA1UEAwwOUm9vayBUZXN0IFJvb3QwIBcNMjYxMTEyMDEwMDA1WhgP\n\
+MjEyNjEwMTkwMTAwMDVaMBkxFzAVBgNVBAMMDlJvb2sgVGVzdCBSb290MIIBIjAN\n\
+BgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx+98y4oirHkZ5DqbyiU3TYTA4XCc\n\
+6METbUed3PiTcqy/95tQ0aoWignhX9Cf8w51dhhghw8gp90/VU11pbf6e4QuZbgf\n\
++RiNAIGOfLBXoxyLV2tVPmP1MrwXgYmdHwoAZs4irmH2iLm/dltMB5+Szu2y5Y3v\n\
+feCof7fdeYxc4xzmypk4WxcJm+s3BGPlB/aYJ610VYikbkTNF+ctOKl9fBY4tzwZ\n\
+cwcWqKP7BiY0fiPfVSNSc+rZ718J0BHeRhU5/a0emlZ3O0UAfktVlveKIlzDjlys\n\
+IEZOmQH26RK5mLrjOMwsSeAofnHS6HdufQaCUSrwWimc75zZHR2Y6WEKmQIDAQAB\n\
+ozIwMDAdBgNVHQ4EFgQUb6nwHFOFh8D4khrWouYxLZLhcJYwDwYDVR0TAQH/BAUw\n\
+AwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAfJ7sMBxJb9ilnIjG5Inx6ZQlRVlC7OGe\n\
+eQn7k5vNQc1Niidfaz6qeiOCt3oZSUhh+sZ3cCVdTB7o7HwHI6ckg+8KkI8VCM+c\n\
+DBjZmYiaZHiNI0iWqWjPXdFA871GSR37jHKvK6q4butLRzFxsrB9L1/r9dm2ees7\n\
+q9eABmG7aMFTtkkJV7moeoKeWdCB8Kd7JPMleEKt68zEJ8PAk7mIPhdd7rz2/oHK\n\
+oCtLdx6DM1XU6V1MDgxgGkLtAvuHyabFuPRKI2kLeXcRg+Qv3qrBIXoAYQEY+U1a\n\
+xVF7VNGrZOpnRdROeSEmIpSW2yrOOPc/TD+/+7ZlnT7n0iW8g4O81Q==\n\
+-----END CERTIFICATE-----\n";
+
+    const CHAIN_LEAF_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDLAzY68fxHVxxg\n\
+6BwNkFWKB7K4zOO3AFOuGebMJNlysue9BTsniWxcq42Iw+CbUf1IXn1HsSvCRYZl\n\
+iHQr/5SDET4piFIQJxj6Tsdcrnl0Cjm2oXY0eV/JV6ZonQ+g4IknuTmPT+7ziAuD\n\
+uPwZ737zRe5x0avByG3qXaN1Jl+k7EcKLfQNBIcFdb1WeCr+Agqs3az8wdpyadGs\n\
+nQXylc49lrKiZrN4gcKtgMXc6Sf0DsQ8SoB/wQ3KPOJTgPkHxXia8yhnL+0ZttOw\n\
+qp6fWz8pssysfQ0vS0sl85NV19b/3zUyTfVxhaTDiC+V+jqE6shC/rFWO/iTgWap\n\
+1/PXzLtFAgMBAAECggEAE9nHTHm7dZ1YtsgTcCcYGiRZDzVnoc4MIKbDONx0j8Db\n\
+JJI1n87R8/jJYOFoXb+lYNVuchtqoDcsplJyq5e05aECv0xnW9F64YTg/RjJYvWa\n\
+AZflp0lj+pvRt4J+E/jIqIP10yPZhWIc4B8vNXkD5JVGtMXwAcWPq95GnK6pJQbR\n\
+taw5bP7AohkOjAvV7Cbd6TCQMjxQeim8bes0hXATTttLH2NkhfUySpEbLCXu3uhg\n\
+gPKe+q/gsFmf0diJr8EeVcKkReZyWjHdP6ssZ8tlWL786oaNaat1SHGurJm5ZyRg\n\
++sDqFpEI7zqDsLg+qr4+WRgkmNunHVfieeRzEsuJeQKBgQD8eBFJHgqnBvh02BR1\n\
+Md2eBpkmYnMZxXMyZJmUVfPm+0QmFjkisQdk7vA5CH7dmfXUdbD0AYBwqN81z4lz\n\
+85VJnG7y2iDcEbNwG5zTwHSHOmrrjBUlBhvSwDdogSKh2diz0lBfAJW31kd/Oe1F\n\
+iPEV4QvTpNxQeaf5p4C+YRisyQKBgQDN2hJlolFY2rKrJwRN6/1aLlfiqYHyuNbr\n\
+W2cwB9mxDToSRyV4MmbAYv8tjWmZvvesTL3swbsrt6jeww0e5h2LRSV1wa6mlTZq\n\
+XLg4RV36pyub/sKxO5jL4jnXL/lo2OTBBxHHKLxAh0lC12TrCZ8R6nupeFtu5RZd\n\
+TuzHBCqknQKBgQDbxUT+ygjp1raHN+WvEuZg/ktoz4B0aZ3auxm5t4ymgAmVwfig\n\
+i0vtf9VbQFr3WmNVO9H6xifhag9Lz0pOxjYpKuSlwF2kVEBIEbFV3w1Q/fg+7OUn\n\
+Iocr0SkqbmcQTwtFlYli+aZarkv0ox85TXjX29woszUZVJ11RGtczjbliQKBgQCx\n\
+Ije2cShitz4LfPV9P9aw5TQG/Smu/VMjD3IJqJewfNs9oy8g8O3uGsHOJuN5wxRI\n\
+lXjQ5Bv1kIKlvV3q+sTtdMC5RcLN4ZQDjmmPMlGeQH+MKnrKG6htuOtgug16JTki\n\
+yLyJjgn/1Oo7tDFI9uyEdCuZNtIm6MaH4ERrNLClGQKBgQCw5Qxw7IoCy/KtMsP/\n\
+CtOTYcG5mzawO0lF7MHyRiCeLp6+7JVgrHsYZbqxe20sb8V+TXsOk6x+g2JLQk/3\n\
+0BzxmFB48rFcn56fOwzLNHwl9BtbSLnnKzYzU1urLuz6pt/UVVuCDw/rj9TfqN1L\n\
+D0gQNmyHayjWoyvGpiGtQMHrGw==\n\
 -----END PRIVATE KEY-----\n";
 
     fn write_pair(directory: &Path, name: &str, certificate: &str) -> (PathBuf, PathBuf) {
@@ -768,5 +894,31 @@ PBU0gcD3kQT2VvHSYVcBmgMTfj5wcNOajJLtTQfhA5bdHDnZ2u5586JTMyuM7va5\n\
         assert_eq!(normalize_host("ExAmPlE.CoM."), "example.com");
         assert_eq!(normalize_host("EXAMPLE.COM"), "example.com");
         assert_eq!(normalize_host("example.com.."), "example.com.");
+    }
+
+    #[test]
+    fn served_chain_drops_self_signed_roots_but_keeps_the_leaf() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = format!("{CHAIN_LEAF}{CHAIN_INTERMEDIATE}{CHAIN_ROOT}");
+        let certificate_path = directory.path().join("chain.pem");
+        let key_path = directory.path().join("chain.key");
+        fs::write(&certificate_path, chain).unwrap();
+        fs::write(&key_path, CHAIN_LEAF_KEY).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let key = load_certified_key(&certificate_path, &key_path).unwrap();
+        // Leaf + intermediate; the self-signed root stays on disk but
+        // never enters a handshake.
+        assert_eq!(key.cert.len(), 2);
+
+        // A self-signed leaf on its own is a legitimate single-cert
+        // chain and must survive.
+        let (solo_cert, solo_key) = write_pair(directory.path(), "solo", TEST_CERTIFICATE);
+        let solo = load_certified_key(&solo_cert, &solo_key).unwrap();
+        assert_eq!(solo.cert.len(), 1);
     }
 }
