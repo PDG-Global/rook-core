@@ -161,13 +161,26 @@ sample() {
 }
 
 # --- bursts -----------------------------------------------------------------
+# Server-side response codes, not client-observed ones: a rapid-reset client
+# RSTs before reading, so codes it saw are weak evidence. The 4xx counter
+# delta across the burst is what the server actually answered — and it settled
+# the loopback question: delta 0 on both paths, so hyper closes the connection
+# and rook's limiter never fires (measured 2026-11-12 against rook-test-01).
+responses_4xx() {
+    curl -s --max-time 5 "$METRICS" \
+        | awk '/^rook_responses_total\{class="4xx"\}/ {print $2}'
+}
+
 run_burst() { # mode
     mode=$1
     say "burst start: $mode"
     rss_before=$(awk -F, 'END {print $2}' "$SAMPLES")
+    r4_before=$(responses_4xx)
     out=$(python3 "$HERE/soak_burst.py" --host "$HOST" --port 443 --mode "$mode" 2>&1) || true
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode $out" >> "$BURSTS"
-    say "burst done: $mode $out"
+    r4_after=$(responses_4xx)
+    delta=$(( ${r4_after:-0} - ${r4_before:-0} ))
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode $out server_4xx_delta=$delta" >> "$BURSTS"
+    say "burst done: $mode $out server_4xx_delta=$delta"
     # Recovery probe: seconds until a normal request succeeds again,
     # capped at 60s. A server that survives the burst but takes a minute
     # to answer ordinary traffic has still been hurt.
