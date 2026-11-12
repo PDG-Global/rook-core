@@ -42,8 +42,13 @@ def connect(host, port, dial):
     return sock
 
 
-def pump(sock, conn, seconds=0.0):
-    """Feed received bytes into the h2 state machine; return events."""
+def pump(sock, conn, codes, seconds=0.0):
+    """Feed received bytes into the h2 state machine; return events.
+
+    Response status codes are appended to `codes` in arrival order: a
+    burst that drew 429s before closing met the rate limiter, one that
+    drew none met something else — the difference between the two
+    answers decides what a burst actually tested."""
     if seconds:
         sock.settimeout(seconds)
     try:
@@ -54,7 +59,25 @@ def pump(sock, conn, seconds=0.0):
         return ["connection-closed"]
     if not data:
         return ["connection-closed"]
-    return conn.receive_data(data) or []
+    events = conn.receive_data(data) or []
+    for event in events:
+        if isinstance(event, h2.events.ResponseReceived):
+            for name, value in event.headers:
+                if name == ":status":
+                    codes.append(value)
+    return events
+
+
+def format_codes(codes):
+    """Ordered, then counted: the first few statuses as seen, plus totals."""
+    if not codes:
+        return "none"
+    shown = ",".join(codes[:12])
+    counts = {}
+    for code in codes:
+        counts[code] = counts.get(code, 0) + 1
+    totals = ";".join(f"{code}x{counts[code]}" for code in counts)
+    return f"{shown}{'...' if len(codes) > 12 else ''} ({totals})"
 
 
 def describe(events):
@@ -79,7 +102,8 @@ def rapid_reset(host, port, streams, dial):
     conn = h2.connection.H2Connection()
     conn.initiate_connection()
     sock.sendall(conn.data_to_send())
-    events = pump(sock, conn, seconds=2.0)
+    codes = []
+    events = pump(sock, conn, codes, seconds=2.0)
     sent = 0
     refusal = describe(events)
     started = time.monotonic()
@@ -98,13 +122,13 @@ def rapid_reset(host, port, streams, dial):
             break
         sent += 1
         if sent % 512 == 0:
-            refusal = describe(pump(sock, conn, seconds=0.1))
+            refusal = describe(pump(sock, conn, codes, seconds=0.1))
     # Drain briefly to catch a GOAWAY that arrived after the last flush.
     if refusal == "none":
-        refusal = describe(pump(sock, conn, seconds=2.0))
+        refusal = describe(pump(sock, conn, codes, seconds=2.0))
     elapsed = time.monotonic() - started
     sock.close()
-    print(f"valid=ok streams_reset={sent} refusal={refusal} seconds={elapsed:.1f}")
+    print(f"valid=ok streams_reset={sent} refusal={refusal} codes={format_codes(codes)} seconds={elapsed:.1f}")
     return 0
 
 
@@ -115,10 +139,17 @@ def frame(ftype, flags, stream_id, payload):
     return header + payload
 
 
-def read_frames(sock, seconds):
-    """Parse frames for `seconds`; returns (refusal, saw_response)."""
+def read_frames(sock, seconds, codes):
+    """Parse frames for `seconds`; returns (refusal, saw_response).
+
+    HEADERS payloads are HPACK-decoded for :status so the burst line can
+    show whether the limiter (429) answered before the connection went."""
+    from hpack import Decoder
+
+    decoder = Decoder()
     sock.settimeout(seconds)
     refusal = "none"
+    saw_response = False
     deadline = time.monotonic() + seconds
     buffer = b""
     while time.monotonic() < deadline and refusal == "none":
@@ -127,9 +158,9 @@ def read_frames(sock, seconds):
         except (socket.timeout, TimeoutError):
             break
         except (ConnectionResetError, ssl.SSLError, BrokenPipeError):
-            return "connection-closed", False
+            return "connection-closed", saw_response
         if not data:
-            return "connection-closed", False
+            return "connection-closed", saw_response
         buffer += data
         while len(buffer) >= 9:
             length = int.from_bytes(buffer[:3], "big")
@@ -144,9 +175,17 @@ def read_frames(sock, seconds):
             elif ftype == 0x3 and len(payload) >= 4:  # RST_STREAM
                 error_code = int.from_bytes(payload[:4], "big")
                 refusal = f"rst_stream(error_code={error_code:#x})"
-            elif ftype == 0x1 or ftype == 0x0:  # HEADERS or DATA: answered
-                return refusal, True
-    return refusal, False
+            elif ftype == 0x1:  # HEADERS
+                saw_response = True
+                try:
+                    for name, value in decoder.decode(payload):
+                        if name == ":status":
+                            codes.append(value)
+                except Exception:
+                    pass  # a partial block is not the thing under test
+            elif ftype == 0x0:  # DATA
+                saw_response = True
+    return refusal, saw_response
 
 
 def continuation(host, port, max_frames, dial):
@@ -180,6 +219,7 @@ def continuation(host, port, max_frames, dial):
     )
     sock.sendall(frame(0x1, 0x0, 1, block))  # HEADERS, flags=0: no END_HEADERS
 
+    codes = []
     sent = 0
     refusal = "none"
     answered = False
@@ -192,14 +232,14 @@ def continuation(host, port, max_frames, dial):
             break
         sent += 1
         if sent % 64 == 0:
-            refusal, answered = read_frames(sock, 0.1)
+            refusal, answered = read_frames(sock, 0.1, codes)
     if refusal == "none" and not answered:
-        refusal, answered = read_frames(sock, 2.0)
+        refusal, answered = read_frames(sock, 2.0, codes)
     elapsed = time.monotonic() - started
     sock.close()
     if answered and refusal == "none":
         refusal = "response-received"
-    print(f"valid=ok continuation_frames={sent} refusal={refusal} seconds={elapsed:.1f}")
+    print(f"valid=ok continuation_frames={sent} refusal={refusal} codes={format_codes(codes)} seconds={elapsed:.1f}")
     return 0
 
 
