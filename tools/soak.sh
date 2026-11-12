@@ -181,6 +181,10 @@ responses_4xx() {
         | awk '/^rook_responses_total\{class="4xx"\}/ {print $2}'
 }
 
+# An empty read must never silently become 0: "server_4xx_delta=0" reads
+# as "the limiter never fired", and an empty rss_before reads as a jump
+# from nothing. Any missing input makes the field INVALID, and the
+# verdict treats an INVALID burst line as a failure.
 run_burst() { # mode
     mode=$1
     say "burst start: $mode"
@@ -194,8 +198,13 @@ run_burst() { # mode
     out=$(python3 "$HERE/soak_burst.py" --host "$HOST" --port 443 --mode "$mode" 2>&1) || true
     r4_after=$(responses_4xx)
     start_traps
-    delta=$(( ${r4_after:-0} - ${r4_before:-0} ))
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode $out server_4xx_delta=$delta" >> "$BURSTS"
+    if [ -n "$r4_before" ] && [ -n "$r4_after" ]; then
+        delta=$(( r4_after - r4_before ))
+    else
+        delta=INVALID
+    fi
+    rss_before=${rss_before:-INVALID}
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode $out server_4xx_delta=$delta rss_before=$rss_before" >> "$BURSTS"
     say "burst done: $mode $out server_4xx_delta=$delta"
     # Recovery probe: seconds until a normal request succeeds again,
     # capped at 60s. A server that survives the burst but takes a minute
@@ -212,9 +221,9 @@ run_burst() { # mode
     sleep 5
     sample
     rss_after=$(awk -F, 'END {print $2}' "$SAMPLES")
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode recovery_seconds=$recovery rss_before=$rss_before rss_after=$rss_after" \
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode recovery_seconds=$recovery rss_before=$rss_before rss_after=${rss_after:-INVALID}" \
         >> "$BURSTS"
-    say "burst recovery: $mode ${recovery}s rss $rss_before -> $rss_after"
+    say "burst recovery: $mode ${recovery}s rss $rss_before -> ${rss_after:-INVALID}"
 }
 
 # --- main loop --------------------------------------------------------------
