@@ -33,7 +33,10 @@ def slope_per_hour(samples):
 
 
 def verdict_line(name, samples, fail_pct):
-    baseline = sum(v for _, v in samples) / len(samples)
+    # The baseline is the FIRST post-warmup sample, not the window mean:
+    # for a growing series the mean sits above the start, so slope/mean
+    # understates the growth a reader thinks the percentage reports.
+    baseline = samples[0][1]
     slope = slope_per_hour(samples)
     pct = (slope / baseline * 100.0) if baseline else 0.0
     ok = pct <= fail_pct
@@ -71,16 +74,19 @@ def main():
 
     gauge_ok, line = verdict_line("gauge_rss_bytes", [(r[0], r[1]) for r in post], args.slope_fail_pct)
     print(line); failures += [] if gauge_ok else ["gauge RSS slope"]
-    # Fds get an absolute floor below which the percentage cannot fail:
-    # the count is small (tens), so a handful of fds per hour is noise a
-    # percentage-of-baseline turns into a false FAIL (seen in dry-runs).
-    # RSS needs no floor: its baseline is megabytes.
+    # Fds get a small absolute floor below which the percentage cannot
+    # fail (the count is tens, so one or two fds of noise becomes a large
+    # percentage — seen in dry-runs), AND a cap on total growth across
+    # the run: +3/hr sounds small but is +72 over 24h, so the run may
+    # grow at most +50 fds from the first post-warmup sample, whichever
+    # binds first. RSS needs no floor: its baseline is megabytes.
     fd_samples = [(r[0], r[3]) for r in post]
-    fd_baseline = sum(v for _, v in fd_samples) / len(fd_samples)
+    fd_baseline = fd_samples[0][1]
     fd_slope = slope_per_hour(fd_samples)
     fd_pct = (fd_slope / fd_baseline * 100.0) if fd_baseline else 0.0
-    fd_ok = fd_pct <= args.slope_fail_pct or fd_slope <= 12
-    print(f"open_fds: baseline={fd_baseline:.0f} slope={fd_slope:+.0f}/hr ({fd_pct:+.3f}%/hr) -> {'ok' if fd_ok else 'FAIL'}")
+    fd_growth = fd_samples[-1][1] - fd_baseline
+    fd_ok = (fd_pct <= args.slope_fail_pct or fd_slope <= 3) and fd_growth <= 50
+    print(f"open_fds: baseline={fd_baseline:.0f} slope={fd_slope:+.0f}/hr ({fd_pct:+.3f}%/hr) growth={fd_growth:+.0f} -> {'ok' if fd_ok else 'FAIL'}")
     if not fd_ok:
         failures.append("fd slope")
     # ps RSS drifts for reasons rook does not control; printed, not judged.

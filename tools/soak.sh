@@ -30,7 +30,7 @@
 # own state drift, not its speed, and an on-box generator keeps a 24-hour run
 # independent of anyone's laptop staying awake.
 #
-# FreeBSD: pkg install nghttp2 python3 && python3 -m pip install h2
+# FreeBSD: pkg install nghttp2 python3 && python3 -m pip install "h2==4.4.1"
 # Usage: soak.sh --host smoke.rookserver.app --metrics http://127.0.0.1:9188/metrics \
 #          [--hours 24] [--work /home/rooksmoke/soak]
 set -eu
@@ -64,12 +64,14 @@ done
 mkdir -p "$WORK"
 for bin in curl h2load python3; do
     command -v "$bin" >/dev/null 2>&1 || {
-        echo "need $bin (FreeBSD: pkg install nghttp2 python3 && python3 -m pip install h2)" >&2
+        echo "need $bin (FreeBSD: pkg install nghttp2 python3 && python3 -m pip install 'h2==4.4.1')" >&2
         exit 2
     }
 done
-python3 -c 'import h2' 2>/dev/null || {
-    echo "need python module h2 (python3 -m pip install h2)" >&2; exit 2
+python3 -c 'import h2; assert h2.__version__ == "4.4.1", h2.__version__' 2>/dev/null || {
+    echo "need python module h2==4.4.1 (python3 -m pip install 'h2==4.4.1')" >&2
+    echo "the pin keeps the soak and gen-01 runs on the library the record names" >&2
+    exit 2
 }
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
