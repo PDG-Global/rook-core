@@ -86,6 +86,7 @@ LOAD_PIDS=""
 stop_load() {
     for pid in $LOAD_PIDS; do kill "$pid" 2>/dev/null || true; done
     LOAD_PIDS=""
+    TRAP_PID=""   # cleared: a stale pid could name a reused process later
     wait 2>/dev/null || true
 }
 cleanup() { stop_load; }
@@ -132,14 +133,23 @@ start_ws() {
 }
 
 # Strike exercise: a slow trickle of trap-path hits keeps the strike path warm
-# without tripping the ban threshold in any window.
+# without tripping the ban threshold in any window. Tracked separately so a
+# burst can pause it: a trickle 404 lands in the same 4xx bucket the burst's
+# server-side delta reads, and the delta must be zero-or-burst-sized.
+TRAP_PID=""
 start_traps() {
     while :; do
         curl -s -o /dev/null --resolve "$HOST:443:127.0.0.1" \
             "https://$HOST/wp-admin" || true
         sleep 90
     done &
-    LOAD_PIDS="$LOAD_PIDS $!"
+    TRAP_PID=$!
+    LOAD_PIDS="$LOAD_PIDS $TRAP_PID"
+}
+
+stop_traps() {
+    [ -n "$TRAP_PID" ] && kill "$TRAP_PID" 2>/dev/null || true
+    TRAP_PID=""
 }
 
 start_load() {
@@ -161,13 +171,41 @@ sample() {
 }
 
 # --- bursts -----------------------------------------------------------------
+# Server-side response codes, not client-observed ones: a rapid-reset client
+# RSTs before reading, so codes it saw are weak evidence. The 4xx counter
+# delta across the burst is what the server actually answered — and it settled
+# the loopback question: delta 0 on both paths, so hyper closes the connection
+# and rook's limiter never fires (measured 2026-11-12 against rook-test-01).
+responses_4xx() {
+    curl -s --max-time 5 "$METRICS" \
+        | awk '/^rook_responses_total\{class="4xx"\}/ {print $2}'
+}
+
+# An empty read must never silently become 0: "server_4xx_delta=0" reads
+# as "the limiter never fired", and an empty rss_before reads as a jump
+# from nothing. Any missing input makes the field INVALID, and the
+# verdict treats an INVALID burst line as a failure.
 run_burst() { # mode
     mode=$1
     say "burst start: $mode"
+    # Pause the trap trickle and let any in-flight hit land BEFORE the
+    # first counter read, so the delta across the burst is the burst's
+    # alone.
+    stop_traps
+    sleep 2
     rss_before=$(awk -F, 'END {print $2}' "$SAMPLES")
+    r4_before=$(responses_4xx)
     out=$(python3 "$HERE/soak_burst.py" --host "$HOST" --port 443 --mode "$mode" 2>&1) || true
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode $out" >> "$BURSTS"
-    say "burst done: $mode $out"
+    r4_after=$(responses_4xx)
+    start_traps
+    if [ -n "$r4_before" ] && [ -n "$r4_after" ]; then
+        delta=$(( r4_after - r4_before ))
+    else
+        delta=INVALID
+    fi
+    rss_before=${rss_before:-INVALID}
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode $out server_4xx_delta=$delta rss_before=$rss_before" >> "$BURSTS"
+    say "burst done: $mode $out server_4xx_delta=$delta"
     # Recovery probe: seconds until a normal request succeeds again,
     # capped at 60s. A server that survives the burst but takes a minute
     # to answer ordinary traffic has still been hurt.
@@ -183,9 +221,9 @@ run_burst() { # mode
     sleep 5
     sample
     rss_after=$(awk -F, 'END {print $2}' "$SAMPLES")
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode recovery_seconds=$recovery rss_before=$rss_before rss_after=$rss_after" \
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) path=on-box $mode recovery_seconds=$recovery rss_before=$rss_before rss_after=${rss_after:-INVALID}" \
         >> "$BURSTS"
-    say "burst recovery: $mode ${recovery}s rss $rss_before -> $rss_after"
+    say "burst recovery: $mode ${recovery}s rss $rss_before -> ${rss_after:-INVALID}"
 }
 
 # --- main loop --------------------------------------------------------------

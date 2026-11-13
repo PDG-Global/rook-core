@@ -116,7 +116,9 @@ def main():
         for line in handle:
             if "valid=" not in line:
                 continue
-            if "valid=INVALID" in line:
+            # Any INVALID field — the client's own negotiation gate or a
+            # failed server-side bracket — fails the run.
+            if "INVALID" in line:
                 failures.append(f"INVALID burst: {line.strip()}")
             elif "refusal=none" in line:
                 failures.append(f"unanswered burst: {line.strip()}")
