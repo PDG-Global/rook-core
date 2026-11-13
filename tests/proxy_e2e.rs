@@ -3307,6 +3307,60 @@ async fn steady_state_reuses_upstream_connections() {
 }
 
 #[tokio::test]
+async fn pooled_connections_expire_after_the_idle_timeout() {
+    // Harry's two-assertion test (2026-11-13): the opened counter is
+    // the only observable the client exposes, so a warm request must
+    // NOT increment it and a post-timeout request MUST. Fails if the
+    // timeout is absent (counter stays flat after the idle period) or
+    // too short (warm request churns).
+    let (upstream, _upstream_task) = spawn_keepalive_upstream().await;
+    let metrics = free_addr().await;
+    let rook = spawn_rook(
+        &[upstream],
+        &format!("upstream_pool_idle_timeout = 2\n\n[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"),
+        "",
+    )
+    .await;
+
+    let warm = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(warm.status, 200);
+    let opened_after_warm = metric_value(metrics, "rook_upstream_connections_opened_total").await;
+
+    // Warm pool: the next request reuses the pooled connection.
+    let warm2 = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(warm2.status, 200);
+    let opened_warm_again = metric_value(metrics, "rook_upstream_connections_opened_total").await;
+    assert_eq!(
+        opened_warm_again, opened_after_warm,
+        "warm request opened a new upstream connection"
+    );
+
+    // Past the idle timeout the pooled connection is gone, so the next
+    // request must open exactly one.
+    sleep(Duration::from_secs(4)).await;
+    let cold = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(cold.status, 200);
+    let opened_after_idle = metric_value(metrics, "rook_upstream_connections_opened_total").await;
+    assert_eq!(
+        opened_after_idle,
+        opened_warm_again + 1,
+        "post-timeout request did not open exactly one new upstream connection"
+    );
+}
+
+#[tokio::test]
 async fn upstream_connect_refusal_is_503_with_retry_after() {
     // A dead upstream refuses the connection: that is overload-shaped,
     // so the answer is 503 with Retry-After, not 502 (Thomas,

@@ -3,6 +3,13 @@ listen = "127.0.0.1:8080"
 max_connections = 4096
 max_connections_per_ip = 256
 max_connections_per_upstream = 1024
+# Idle upstream connections pooled for reuse, per upstream host. Default:
+# min(max_connections, max_connections_per_upstream); an explicit value is
+# clamped to the same bound. A too-small pool turns overload into upstream
+# dial churn; the descriptor budget check bounds the total.
+# upstream_pool_idle = 1024
+# Seconds an idle pooled upstream connection is kept. Default 30.
+# upstream_pool_idle_timeout = 30
 max_upstream_per_ip = 64
 max_tracked_clients = 10000
 requests_per_second = 100
