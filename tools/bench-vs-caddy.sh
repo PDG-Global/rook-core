@@ -119,6 +119,11 @@ request_burst = 1000000
 max_connections = 100000
 max_connections_per_ip = 100000
 max_connections_per_upstream = 100000
+# Third per-IP limit in the path: the upstream connection cap (default 64).
+# Missing it made every cell at c>=64 return 502s from the upstream pool -
+# which reads as "the proxy cannot handle 64 concurrent" when it was the
+# harness that forgot a limit.
+max_upstream_per_ip = 100000
 
 [[sites]]
 hosts = ["$TARGET_HOST"]
