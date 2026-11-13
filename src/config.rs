@@ -56,14 +56,21 @@ pub struct ServerConfig {
     pub max_connections_per_ip: usize,
     pub max_connections_per_upstream: usize,
     /// Idle upstream connections kept for reuse, per upstream host
-    /// (hyper's `pool_max_idle_per_host`). Hard-capped at
-    /// `max_connections_per_upstream` at load, so the pool can never
-    /// hold more descriptors than the upstream concurrency limit
-    /// allows in flight (Harry/Thomas, saturation window 2026-11-13:
-    /// a fixed pool of 8 passed client concurrency through to the
-    /// backend as connection churn and the upstream's accept queue
-    /// was the first thing to saturate).
+    /// (hyper's `pool_max_idle_per_host`). When unset, follows
+    /// `min(max_connections, max_connections_per_upstream)`; an explicit
+    /// value is clamped to the same bound at load, so the pool can never
+    /// hold more descriptors than the client or upstream concurrency
+    /// limits allow in flight (Harry/Thomas, saturation windows
+    /// 2026-11-13: under saturation the upstream working set tracks
+    /// in-flight requests, so a small fixed pool turns overload into
+    /// dial churn — positive feedback on a CPU-bound box; the fd budget
+    /// check is what makes a large pool safe).
     pub upstream_pool_idle: usize,
+    /// How long an idle pooled upstream connection is kept before the
+    /// pool drops it (hyper's `pool_idle_timeout`). A burst's parked
+    /// sockets drain afterwards instead of idling on a quiet box
+    /// (Thomas, 2026-11-13).
+    pub upstream_pool_idle_timeout: Duration,
     pub max_upstream_per_ip: usize,
     pub max_tracked_clients: usize,
     pub requests_per_second: u32,
@@ -347,7 +354,8 @@ struct RawServerConfig {
     max_connections: usize,
     max_connections_per_ip: usize,
     max_connections_per_upstream: usize,
-    upstream_pool_idle: usize,
+    upstream_pool_idle: Option<usize>,
+    upstream_pool_idle_timeout: u64,
     max_upstream_per_ip: usize,
     max_tracked_clients: usize,
     requests_per_second: u32,
@@ -380,7 +388,8 @@ impl Default for RawServerConfig {
             max_connections: 4096,
             max_connections_per_ip: 256,
             max_connections_per_upstream: 1024,
-            upstream_pool_idle: 32,
+            upstream_pool_idle: None,
+            upstream_pool_idle_timeout: 30,
             max_upstream_per_ip: 64,
             max_tracked_clients: 10000,
             requests_per_second: 100,
@@ -656,6 +665,13 @@ fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
         None => StrikeRulesConfig::default(),
     };
 
+    // The idle pool follows the smaller of the client and upstream
+    // concurrency caps when unset; an explicit value is clamped to
+    // the same bound. Worst-case pool descriptors stay bounded by
+    // numbers the operator already chose, and the fd budget check
+    // covers their sum.
+    let pool_bound = raw.max_connections.min(raw.max_connections_per_upstream);
+    let upstream_pool_idle = raw.upstream_pool_idle.unwrap_or(pool_bound).min(pool_bound);
     let server = ServerConfig {
         listen,
         https_listen,
@@ -667,10 +683,8 @@ fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
         max_connections: raw.max_connections,
         max_connections_per_ip: raw.max_connections_per_ip,
         max_connections_per_upstream: raw.max_connections_per_upstream,
-        // Hard ceiling: the idle pool never exceeds the upstream
-        // concurrency cap, so worst-case pool descriptors stay bounded
-        // by the number the operator already chose.
-        upstream_pool_idle: raw.upstream_pool_idle.min(raw.max_connections_per_upstream),
+        upstream_pool_idle,
+        upstream_pool_idle_timeout: Duration::from_secs(raw.upstream_pool_idle_timeout),
         max_upstream_per_ip: raw.max_upstream_per_ip,
         max_tracked_clients: raw.max_tracked_clients,
         requests_per_second: raw.requests_per_second,
@@ -742,6 +756,7 @@ impl ServerConfig {
             header_read_timeout,
             request_timeout,
             upstream_connect_timeout,
+            upstream_pool_idle_timeout,
             idle_timeout,
             websocket_idle_timeout,
             websocket_max_lifetime,
@@ -1826,18 +1841,32 @@ upstreams = ["http://127.0.0.1"]
 
     #[test]
     fn upstream_pool_idle_defaults_and_clamps() {
-        // Default: a small pool (low tens) so normal traffic reuses
-        // upstream connections instead of churning one per request.
+        // Default: the pool follows the smaller of the client and
+        // upstream concurrency caps — here min(4096, 1024) — so it can
+        // absorb the working set under saturation instead of churning
+        // (saturation windows 2026-11-13).
         let config = Config::parse(minimal_config()).unwrap();
-        assert_eq!(config.server.upstream_pool_idle, 32);
+        assert_eq!(config.server.upstream_pool_idle, 1024);
 
-        // Explicit value survives.
+        // The client cap binds when it is the smaller one.
+        let small_clients = format!(
+            "[server]\nmax_connections = 10\n{}",
+            minimal_config()
+        );
+        assert_eq!(
+            Config::parse(&small_clients)
+                .unwrap()
+                .server
+                .upstream_pool_idle,
+            10
+        );
+
+        // Explicit value survives when it is inside the bound.
         let set = format!("[server]\nupstream_pool_idle = 64\n{}", minimal_config());
         assert_eq!(Config::parse(&set).unwrap().server.upstream_pool_idle, 64);
 
-        // Hard ceiling: the idle pool can never exceed the upstream
-        // concurrency cap, so pool descriptors stay bounded by the
-        // number the operator already chose.
+        // An explicit value past the bound is clamped to it: pool
+        // descriptors stay bounded by numbers the operator already chose.
         let over = format!(
             "[server]\nupstream_pool_idle = 5000\nmax_connections_per_upstream = 100\n{}",
             minimal_config()
@@ -1848,6 +1877,34 @@ upstreams = ["http://127.0.0.1"]
         // Zero disables reuse, which is the churn bug this knob exists
         // to fix — rejected like every other zero limit.
         let zero = format!("[server]\nupstream_pool_idle = 0\n{}", minimal_config());
+        assert!(Config::parse(&zero).is_err());
+    }
+
+    #[test]
+    fn upstream_pool_idle_timeout_parses() {
+        // Default 30 seconds (Thomas, 2026-11-13: a burst's parked
+        // sockets must drain on their own afterwards).
+        let config = Config::parse(minimal_config()).unwrap();
+        assert_eq!(
+            config.server.upstream_pool_idle_timeout,
+            Duration::from_secs(30)
+        );
+
+        let set = format!(
+            "[server]\nupstream_pool_idle_timeout = 5\n{}",
+            minimal_config()
+        );
+        assert_eq!(
+            Config::parse(&set).unwrap().server.upstream_pool_idle_timeout,
+            Duration::from_secs(5)
+        );
+
+        // Zero would keep the pool permanently expired — the churn bug
+        // again, a config line away. Rejected like the other timeouts.
+        let zero = format!(
+            "[server]\nupstream_pool_idle_timeout = 0\n{}",
+            minimal_config()
+        );
         assert!(Config::parse(&zero).is_err());
     }
 

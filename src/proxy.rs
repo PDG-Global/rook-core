@@ -245,6 +245,7 @@ impl AppState {
             .http1_max_buf_size(config.server.max_header_bytes)
             .http1_max_headers(100)
             .pool_max_idle_per_host(config.server.upstream_pool_idle)
+            .pool_idle_timeout(config.server.upstream_pool_idle_timeout)
             .build(connector);
 
         // The exempt set is the operator allowlist plus the trusted
