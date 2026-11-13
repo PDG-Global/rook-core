@@ -41,6 +41,22 @@ pub fn validate_local(config: &Config) -> Result<()> {
 }
 
 pub async fn run(config: Config) -> Result<()> {
+    // What the operator asked the upstream side for, as one number:
+    // pool x upstreams is the idle-socket working set this config can
+    // park, and seeing it at startup beats discovering it at 3am
+    // (Harry, saturation window 2026-11-13).
+    let upstreams: usize = config
+        .sites
+        .iter()
+        .flat_map(|site| site.routes.iter())
+        .map(|route| route.upstreams.len())
+        .sum();
+    info!(
+        pool_idle_per_upstream = config.server.upstream_pool_idle,
+        upstreams,
+        pool_idle_total = config.server.upstream_pool_idle * upstreams,
+        "upstream connection pool configured"
+    );
     let state = AppState::new(config.clone());
     let trust = crate::trust::TrustPolicy::load(config.server.blocklist_file.as_deref())?;
     let tls = match config.server.https_listen {

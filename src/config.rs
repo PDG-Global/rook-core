@@ -55,6 +55,15 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub max_connections_per_ip: usize,
     pub max_connections_per_upstream: usize,
+    /// Idle upstream connections kept for reuse, per upstream host
+    /// (hyper's `pool_max_idle_per_host`). Hard-capped at
+    /// `max_connections_per_upstream` at load, so the pool can never
+    /// hold more descriptors than the upstream concurrency limit
+    /// allows in flight (Harry/Thomas, saturation window 2026-11-13:
+    /// a fixed pool of 8 passed client concurrency through to the
+    /// backend as connection churn and the upstream's accept queue
+    /// was the first thing to saturate).
+    pub upstream_pool_idle: usize,
     pub max_upstream_per_ip: usize,
     pub max_tracked_clients: usize,
     pub requests_per_second: u32,
@@ -156,6 +165,78 @@ pub enum ConfigError {
     Validation { field: String, message: String },
 }
 
+/// Outcome of the file-descriptor budget check (Harry/Thomas,
+/// saturation window 2026-11-13): the worst case the process can be
+/// asked to hold is `max_connections` client sockets plus
+/// `max_connections_per_upstream` per upstream host plus the
+/// listeners, and that sum has to sit comfortably under
+/// `RLIMIT_NOFILE` or the box hits EMFILE under load — the failure
+/// arrives at 3am, not at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdBudget {
+    /// The sum is at or under half the limit.
+    Within { total: u64, limit: u64 },
+    /// The sum exceeds half the limit: worth an operator's eye.
+    Warn {
+        total: u64,
+        limit: u64,
+        dominant: &'static str,
+    },
+    /// The sum exceeds 90% of the limit: the process would hit EMFILE
+    /// under load, so it refuses to start.
+    Exceeds {
+        total: u64,
+        limit: u64,
+        dominant: &'static str,
+    },
+}
+
+/// Check the worst-case descriptor budget against `nofile_limit`
+/// (the process's soft RLIMIT_NOFILE). Pure so the thresholds are
+/// testable without rlimit fiddling.
+pub fn fd_budget(
+    max_connections: u64,
+    max_connections_per_upstream: u64,
+    upstreams: u64,
+    listeners: u64,
+    nofile: u64,
+) -> FdBudget {
+    let client = max_connections;
+    let upstream = max_connections_per_upstream.saturating_mul(upstreams);
+    let total = client.saturating_add(upstream).saturating_add(listeners);
+    let dominant = if client >= upstream && client >= listeners {
+        "client connections (server.max_connections)"
+    } else if upstream >= listeners {
+        "upstream connections (server.max_connections_per_upstream x upstream count)"
+    } else {
+        "listeners"
+    };
+    if total > nofile * 90 / 100 {
+        FdBudget::Exceeds {
+            total,
+            limit: nofile,
+            dominant,
+        }
+    } else if total > nofile / 2 {
+        FdBudget::Warn {
+            total,
+            limit: nofile,
+            dominant,
+        }
+    } else {
+        FdBudget::Within {
+            total,
+            limit: nofile,
+        }
+    }
+}
+
+/// The process's soft RLIMIT_NOFILE, if the platform reports one.
+/// `None` (unlimited, or a platform without the call) skips the check.
+fn rlimit_nofile() -> Option<u64> {
+    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+}
+
 impl Config {
     /// Read, parse, and validate a TOML configuration file.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -163,7 +244,59 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::parse(&input)
+        let config = Self::parse(&input)?;
+        config.check_fd_budget()?;
+        Ok(config)
+    }
+
+    /// Worst-case descriptor budget against RLIMIT_NOFILE. Warns on
+    /// stderr above 50% of the limit and refuses to load above 90%,
+    /// naming the dominant term either way (a pool too big and a
+    /// client cap too big are different fixes).
+    fn check_fd_budget(&self) -> Result<(), ConfigError> {
+        let Some(nofile) = rlimit_nofile() else {
+            return Ok(());
+        };
+        let upstreams: u64 = self
+            .sites
+            .iter()
+            .flat_map(|site| site.routes.iter())
+            .map(|route| route.upstreams.len() as u64)
+            .sum();
+        let listeners =
+            1 + u64::from(self.server.https_listen.is_some()) + u64::from(self.metrics.enabled);
+        match fd_budget(
+            self.server.max_connections as u64,
+            self.server.max_connections_per_upstream as u64,
+            upstreams,
+            listeners,
+            nofile,
+        ) {
+            FdBudget::Within { .. } => Ok(()),
+            FdBudget::Warn {
+                total,
+                limit,
+                dominant,
+            } => {
+                eprintln!(
+                    "warning: worst-case descriptor budget {total} exceeds 50% of \
+                     RLIMIT_NOFILE ({limit}); dominant term: {dominant}"
+                );
+                Ok(())
+            }
+            FdBudget::Exceeds {
+                total,
+                limit,
+                dominant,
+            } => Err(validation(
+                "server",
+                format!(
+                    "worst-case descriptor budget {total} exceeds 90% of RLIMIT_NOFILE \
+                     ({limit}); the process would hit EMFILE under load. Dominant term: \
+                     {dominant}"
+                ),
+            )),
+        }
     }
 
     /// Parse and validate TOML configuration. Durations are integer seconds.
@@ -214,6 +347,7 @@ struct RawServerConfig {
     max_connections: usize,
     max_connections_per_ip: usize,
     max_connections_per_upstream: usize,
+    upstream_pool_idle: usize,
     max_upstream_per_ip: usize,
     max_tracked_clients: usize,
     requests_per_second: u32,
@@ -246,6 +380,7 @@ impl Default for RawServerConfig {
             max_connections: 4096,
             max_connections_per_ip: 256,
             max_connections_per_upstream: 1024,
+            upstream_pool_idle: 32,
             max_upstream_per_ip: 64,
             max_tracked_clients: 10000,
             requests_per_second: 100,
@@ -532,6 +667,10 @@ fn parse_server(raw: RawServerConfig) -> Result<ServerConfig, ConfigError> {
         max_connections: raw.max_connections,
         max_connections_per_ip: raw.max_connections_per_ip,
         max_connections_per_upstream: raw.max_connections_per_upstream,
+        // Hard ceiling: the idle pool never exceeds the upstream
+        // concurrency cap, so worst-case pool descriptors stay bounded
+        // by the number the operator already chose.
+        upstream_pool_idle: raw.upstream_pool_idle.min(raw.max_connections_per_upstream),
         max_upstream_per_ip: raw.max_upstream_per_ip,
         max_tracked_clients: raw.max_tracked_clients,
         requests_per_second: raw.requests_per_second,
@@ -572,6 +711,7 @@ impl ServerConfig {
             max_connections,
             max_connections_per_ip,
             max_connections_per_upstream,
+            upstream_pool_idle,
             max_upstream_per_ip,
             max_tracked_clients,
             requests_per_second,
@@ -1682,6 +1822,75 @@ upstreams = ["http://127.0.0.1"]
                 .replace("[server]\nhttps_listen = '127.0.0.1:8443'\n", "");
         let error = Config::parse(&without_https).unwrap_err().to_string();
         assert!(error.contains("sites[0].acme"), "{error}");
+    }
+
+    #[test]
+    fn upstream_pool_idle_defaults_and_clamps() {
+        // Default: a small pool (low tens) so normal traffic reuses
+        // upstream connections instead of churning one per request.
+        let config = Config::parse(minimal_config()).unwrap();
+        assert_eq!(config.server.upstream_pool_idle, 32);
+
+        // Explicit value survives.
+        let set = format!("[server]\nupstream_pool_idle = 64\n{}", minimal_config());
+        assert_eq!(Config::parse(&set).unwrap().server.upstream_pool_idle, 64);
+
+        // Hard ceiling: the idle pool can never exceed the upstream
+        // concurrency cap, so pool descriptors stay bounded by the
+        // number the operator already chose.
+        let over = format!(
+            "[server]\nupstream_pool_idle = 5000\nmax_connections_per_upstream = 100\n{}",
+            minimal_config()
+        );
+        let config = Config::parse(&over).unwrap();
+        assert_eq!(config.server.upstream_pool_idle, 100);
+
+        // Zero disables reuse, which is the churn bug this knob exists
+        // to fix — rejected like every other zero limit.
+        let zero = format!("[server]\nupstream_pool_idle = 0\n{}", minimal_config());
+        assert!(Config::parse(&zero).is_err());
+    }
+
+    #[test]
+    fn fd_budget_thresholds() {
+        // Well under half the limit: quiet.
+        assert_eq!(
+            fd_budget(100, 100, 1, 3, 11000),
+            FdBudget::Within {
+                total: 203,
+                limit: 11000
+            }
+        );
+        // Over half, under 90%: warn, naming the dominant term.
+        assert_eq!(
+            fd_budget(6000, 1024, 1, 3, 11000),
+            FdBudget::Warn {
+                total: 7027,
+                limit: 11000,
+                dominant: "client connections (server.max_connections)",
+            }
+        );
+        // An oversized upstream side dominates and is named instead —
+        // the fix is different, so the message has to say which.
+        assert_eq!(
+            fd_budget(1000, 1024, 8, 3, 11000),
+            FdBudget::Warn {
+                total: 9195,
+                limit: 11000,
+                dominant: "upstream connections (server.max_connections_per_upstream x upstream count)",
+            }
+        );
+        // Over 90%: refuse.
+        assert!(matches!(
+            fd_budget(10000, 1024, 1, 3, 11000),
+            FdBudget::Exceeds { .. }
+        ));
+        // Stock config on a small (11k fd) box: 4096 + 1024 + 3 = 5123,
+        // 46% of the limit — must start without a warning.
+        assert!(matches!(
+            fd_budget(4096, 1024, 1, 3, 11000),
+            FdBudget::Within { .. }
+        ));
     }
 
     #[test]

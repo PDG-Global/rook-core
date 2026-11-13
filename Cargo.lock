@@ -953,6 +953,7 @@ dependencies = [
  "ipnet",
  "memory-stats",
  "pin-project-lite",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

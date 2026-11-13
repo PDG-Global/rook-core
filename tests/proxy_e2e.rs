@@ -851,7 +851,19 @@ async fn spawn_rook_child(upstream: SocketAddr, low_fd_limit: bool) -> ChildRook
     let addr = free_addr().await;
     let config_dir = tempfile::tempdir().unwrap();
     let config_path = config_dir.path().join("rookd.toml");
-    std::fs::write(&config_path, rook_config(addr, &[upstream], "", "")).unwrap();
+    // Under the low fd limit the default config's worst-case budget
+    // (4096 + 1024 + listeners) far exceeds 90% of 24 and would refuse
+    // to start — which is the budget check doing its job. This test
+    // exists for the runtime EMFILE path, so its config passes the
+    // check (12 + 4 + 1 = 17 <= 21) while the runtime table still
+    // fills: baseline ~11 descriptors plus 12 client connections
+    // exceeds 24 before the cap engages.
+    let settings = if low_fd_limit {
+        "max_connections = 12\nmax_connections_per_upstream = 4\nupstream_pool_idle = 2\n"
+    } else {
+        ""
+    };
+    std::fs::write(&config_path, rook_config(addr, &[upstream], settings, "")).unwrap();
     let binary = env!("CARGO_BIN_EXE_rookd");
     let mut command = if low_fd_limit {
         let descriptors = (3..=9)
@@ -1167,7 +1179,7 @@ async fn content_length_above_configured_max_returns_413() {
 }
 
 #[tokio::test]
-async fn unreachable_upstream_returns_502_without_upstream_details() {
+async fn unreachable_upstream_returns_503_without_upstream_details() {
     let upstream = free_addr().await;
     let rook = spawn_rook(&[upstream], "", "").await;
     let response = send_request(
@@ -1175,7 +1187,9 @@ async fn unreachable_upstream_returns_502_without_upstream_details() {
         "GET /unavailable HTTP/1.1\r\nHost: example.com\r\n\r\n",
     )
     .await;
-    assert_error_response(&response, 502, upstream);
+    // Connect refusal is overload-shaped: 503 + Retry-After (the
+    // header is pinned in upstream_connect_refusal_is_503_with_retry_after).
+    assert_error_response(&response, 503, upstream);
 }
 
 #[tokio::test]
@@ -3183,4 +3197,127 @@ async fn strikes_key_on_the_verified_visitor_not_the_proxy() {
     )
     .await;
     assert_eq!(r.status, 200);
+}
+
+/// An upstream that keeps its side of the connection open, so the
+/// pool has something to reuse: serves request after request on one
+/// connection until the peer goes away.
+async fn spawn_keepalive_upstream() -> (SocketAddr, TaskGuard) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let mut peek = [0u8; 1];
+                    match stream.peek(&mut peek).await {
+                        Ok(0) | Err(_) => return, // peer closed
+                        Ok(_) => {}
+                    }
+                    let _ = read_head(&mut stream).await;
+                    let body = b"ok";
+                    let response =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(body).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, TaskGuard(task))
+}
+
+/// Scrape a counter off the metrics listener.
+async fn metric_value(addr: SocketAddr, name: &str) -> u64 {
+    let response = send_request(
+        addr,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let body = String::from_utf8_lossy(&response.body).into_owned();
+    body.lines()
+        .find_map(|line| line.strip_prefix(name))
+        .and_then(|rest| rest.trim().parse().ok())
+        .unwrap_or_else(|| panic!("metric {name} missing from {body}"))
+}
+
+#[tokio::test]
+async fn steady_state_reuses_upstream_connections() {
+    // Harry's churn test (saturation window 2026-11-13): at steady
+    // state the pool must absorb the load — connections opened per
+    // request far below 1% — and must stop growing when load stops.
+    let (upstream, _upstream_task) = spawn_keepalive_upstream().await;
+    let metrics = free_addr().await;
+    let rook = spawn_rook(
+        &[upstream],
+        // The limiter is not the thing under test; the pool is.
+        &format!("requests_per_second = 1000000\nrequest_burst = 1000000\n\n[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"),
+        "",
+    )
+    .await;
+
+    // Warm the pool past the working set.
+    for _ in 0..64 {
+        let r = send_request(
+            rook.addr,
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(r.status, 200);
+    }
+    let opened_before = metric_value(metrics, "rook_upstream_connections_opened_total").await;
+
+    // Steady state: 2000 requests, 16 concurrent — inside the default
+    // pool of 32, so almost no new upstream connections may open.
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let addr = rook.addr;
+        tasks.spawn(async move {
+            for _ in 0..125 {
+                let r = send_request(
+                    addr,
+                    "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                assert_eq!(r.status, 200);
+            }
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+
+    let opened_after = metric_value(metrics, "rook_upstream_connections_opened_total").await;
+    let delta = opened_after - opened_before;
+    assert!(
+        delta * 100 < 2000,
+        "steady state opened {delta} upstream connections for 2000 requests (limit 1%)"
+    );
+
+    // And once load stops the pool stops growing: two scrapes a second
+    // apart see the same counter.
+    sleep(Duration::from_secs(1)).await;
+    let idle_a = metric_value(metrics, "rook_upstream_connections_opened_total").await;
+    sleep(Duration::from_secs(1)).await;
+    let idle_b = metric_value(metrics, "rook_upstream_connections_opened_total").await;
+    assert_eq!(idle_a, idle_b, "pool kept opening connections while idle");
+}
+
+#[tokio::test]
+async fn upstream_connect_refusal_is_503_with_retry_after() {
+    // A dead upstream refuses the connection: that is overload-shaped,
+    // so the answer is 503 with Retry-After, not 502 (Thomas,
+    // saturation window 2026-11-13).
+    let dead = free_addr().await; // bound, then dropped: refuses connects
+    let rook = spawn_rook(&[dead], "", "").await;
+    let r = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 503);
+    assert_eq!(r.header("retry-after"), Some("1"));
 }

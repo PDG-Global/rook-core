@@ -89,6 +89,12 @@ struct Inner {
     responses_by_class: [AtomicU64; 5],
     tls_handshake_failures: AtomicU64,
     upstream_failures: AtomicU64,
+    /// TCP connections opened to upstreams (attempts that connected).
+    /// Next to `requests` this is the churn ratio: connections opened
+    /// per request should sit far below 1 at steady state — a ratio
+    /// near 1 means the idle pool is not absorbing anything (Harry,
+    /// saturation window 2026-11-13).
+    upstream_connections_opened: AtomicU64,
     /// Upstream request-latency histogram, by kind. Slots are
     /// NON-cumulative (slot i counts observations in
     /// `(bucket[i-1], bucket[i]]`, the last slot counts the rest);
@@ -156,6 +162,22 @@ impl Metrics {
     /// An upstream connect/request failed or timed out.
     pub fn upstream_failed(&self) {
         self.inner.upstream_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A new TCP connection to an upstream connected. Called by the
+    /// guarded connector on every successful connect; pooled reuse
+    /// never touches this, which is what makes it a churn meter.
+    pub fn upstream_connection_opened(&self) {
+        self.inner
+            .upstream_connections_opened
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot of the churn counter, for tests and the startup log.
+    pub fn upstream_connections_opened(&self) -> u64 {
+        self.inner
+            .upstream_connections_opened
+            .load(Ordering::Relaxed)
     }
 
     /// An upstream request finished, one way or another: time from
@@ -253,6 +275,11 @@ impl Metrics {
             out,
             "# HELP rook_upstream_failures_total Upstream requests that failed or timed out.\n# TYPE rook_upstream_failures_total counter\nrook_upstream_failures_total {}",
             inner.upstream_failures.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP rook_upstream_connections_opened_total TCP connections opened to upstreams. Compare with rook_requests_total: connections opened per request should sit far below 1 at steady state.\n# TYPE rook_upstream_connections_opened_total counter\nrook_upstream_connections_opened_total {}",
+            inner.upstream_connections_opened.load(Ordering::Relaxed)
         );
 
         out.push_str("# HELP rook_upstream_request_duration_seconds Time from starting an upstream request (connect included) to its outcome: response head for HTTP, validated 101 for WebSockets. Failed and timed-out requests are included (they are also counted in rook_upstream_failures_total); a timeout's elapsed is a lower bound.\n");

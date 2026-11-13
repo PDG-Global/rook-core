@@ -328,7 +328,8 @@ async fn failed_upstream_requests_still_record_latency() {
     .await;
 
     let (status, _, _) = get(rook.addr, "example.com", "/").await;
-    assert_eq!(status, 502);
+    // Dead upstream = connect failure = 503, not 502.
+    assert_eq!(status, 503);
 
     let (status, _, body) = get(rook.metrics, "localhost", "/metrics").await;
     assert_eq!(status, 200);
@@ -467,7 +468,10 @@ async fn the_proxy_cannot_dial_the_metrics_listener() {
         "GET / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n",
     )
     .await;
-    assert_eq!(status, 502);
+    // A connect-time refusal is a 503 (the upstream cannot take load),
+    // not a 502 (a failed in-flight exchange). The Retry-After header
+    // is pinned in proxy_e2e.
+    assert_eq!(status, 503);
 
     // The refusal is visible to the operator, not silent.
     let (_, _, body) = get(rook.metrics, "localhost", "/metrics").await;

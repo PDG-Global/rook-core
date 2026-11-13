@@ -22,7 +22,7 @@ use http::{
 use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
 use hyper::body::{Body, Incoming};
 use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
+    client::legacy::{Client, Error as ClientError, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
 use ipnet::IpNet;
@@ -68,6 +68,7 @@ type ProxyResult = Result<Response<ResponseBody>, ProxyError>;
 pub struct GuardedConnector {
     inner: HttpConnector,
     blocked: Option<SocketAddr>,
+    metrics: crate::metrics::Metrics,
 }
 
 impl GuardedConnector {
@@ -101,9 +102,15 @@ impl tower_service::Service<Uri> for GuardedConnector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let blocked = self.blocked;
+        let metrics = self.metrics.clone();
         let connect = self.inner.call(uri);
         Box::pin(async move {
             let stream = connect.await?;
+            // A fresh upstream TCP connection: pooled reuse never
+            // reaches the connector, so this counter is the churn
+            // meter (connections opened per request, vs the request
+            // counter, should sit far below 1 at steady state).
+            metrics.upstream_connection_opened();
             let peer = stream.inner().peer_addr()?;
             if Self::is_blocked(blocked, peer) {
                 return Err(Self::refused().into());
@@ -232,11 +239,12 @@ impl AppState {
         let connector = GuardedConnector {
             inner: connector,
             blocked,
+            metrics: metrics.clone(),
         };
         let client = Client::builder(TokioExecutor::new())
             .http1_max_buf_size(config.server.max_header_bytes)
             .http1_max_headers(100)
-            .pool_max_idle_per_host(8)
+            .pool_max_idle_per_host(config.server.upstream_pool_idle)
             .build(connector);
 
         // The exempt set is the operator allowlist plus the trusted
@@ -648,7 +656,7 @@ impl AppState {
         // a success-only latency flatters a degrading upstream.
         self.metrics
             .upstream_latency(crate::metrics::UpstreamKind::Http, started.elapsed());
-        let response = response?.map_err(upstream_request_error)?;
+        let response = response?.map_err(upstream_client_error)?;
         Ok(map_response(
             response,
             self.config.server.idle_timeout,
@@ -878,7 +886,16 @@ impl ProxyError {
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::BadGateway => StatusCode::BAD_GATEWAY,
-            Self::UpstreamUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::UpstreamUnavailable => {
+                let mut response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
+                // Static and cheap: the point is that well-behaved
+                // clients back off, not precision about the deadline.
+                response.headers_mut().insert(
+                    http::header::RETRY_AFTER,
+                    http::HeaderValue::from_static("1"),
+                );
+                return response;
+            }
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
         };
         empty_response(status)
@@ -1173,6 +1190,18 @@ fn protected_header(name: &HeaderName) -> bool {
                 | "sec-websocket-protocol"
                 | "sec-websocket-extensions"
         )
+}
+
+/// Errors from the pooled client: a connect failure is the upstream
+/// refusing load — answer 503 with Retry-After so overload reads as a
+/// refusal, not a failure (Thomas, saturation window 2026-11-13).
+/// Errors after the request was accepted stay 502.
+fn upstream_client_error(error: ClientError) -> ProxyError {
+    if error.is_connect() {
+        debug!(error = %error, "upstream refused the connection");
+        return ProxyError::UpstreamUnavailable;
+    }
+    upstream_request_error(error)
 }
 
 fn upstream_request_error(error: impl std::error::Error) -> ProxyError {
