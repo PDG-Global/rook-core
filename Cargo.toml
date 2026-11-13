@@ -24,6 +24,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["ring",
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "time", "x509-parser", "hyper-rustls", "rcgen"] }
 ipnet = "2"
 pin-project-lite = "0.2"
+rustix = { version = "1", features = ["process"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
