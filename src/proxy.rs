@@ -664,18 +664,16 @@ impl AppState {
         // hurt with: a safe method and no body (Thomas/Harry, 2026-11-14).
         // A replayed write is worse than a 502, so POST/PUT/PATCH/DELETE
         // and any request with a body never get a second attempt.
-        let retry_seed = match *request.method() {
-            http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
-                if request.body().size_hint().exact() == Some(0) =>
-            {
+        let retry_seed =
+            if retryable_seed(request.method(), request.body().size_hint().exact()) {
                 Some((
                     request.method().clone(),
                     request.uri().clone(),
                     request.headers().clone(),
                 ))
-            }
-            _ => None,
-        };
+            } else {
+                None
+            };
         let response = with_upload_timeout(
             &upload_tracker,
             self.config.server.request_timeout,
@@ -693,22 +691,39 @@ impl AppState {
                 // opens a fresh connection. Same permits: concurrent
                 // upstream load does not change, and the guard is
                 // neither leaked nor double-acquired (Harry).
-                let (method, uri, headers) = retry_seed.expect("checked above");
-                self.metrics.upstream_retried();
-                debug!(%uri, "pooled upstream connection died; retrying once on a fresh connection");
-                let empty: RequestBody =
-                    Box::pin(http_body_util::Empty::new().map_err(|never| match never {}));
-                let mut rebuilt = Request::new(empty);
-                *rebuilt.method_mut() = method;
-                *rebuilt.uri_mut() = uri;
-                *rebuilt.headers_mut() = headers;
-                with_upload_timeout(
-                    &upload_tracker,
-                    self.config.server.request_timeout,
-                    self.config.server.idle_timeout,
-                    self.client.request(rebuilt),
-                )
-                .await
+                //
+                // Budget: the client waits one request_timeout in total,
+                // not one per attempt (Thomas). saturating_sub because
+                // elapsed can already exceed the timeout — and a zero
+                // remainder skips the retry rather than issuing an
+                // attempt with no budget (Harry).
+                let remaining = self
+                    .config
+                    .server
+                    .request_timeout
+                    .saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    Ok(Err(first))
+                } else {
+                    let (method, uri, headers) = retry_seed.expect("checked above");
+                    self.metrics.upstream_retried();
+                    // Path only: a full URI puts the query string in the
+                    // log, and query strings carry tokens (Thomas/Harry).
+                    debug!(path = uri.path(), "pooled upstream connection died; retrying once on a fresh connection");
+                    let empty: RequestBody =
+                        Box::pin(http_body_util::Empty::new().map_err(|never| match never {}));
+                    let mut rebuilt = Request::new(empty);
+                    *rebuilt.method_mut() = method;
+                    *rebuilt.uri_mut() = uri;
+                    *rebuilt.headers_mut() = headers;
+                    with_upload_timeout(
+                        &upload_tracker,
+                        remaining,
+                        self.config.server.idle_timeout,
+                        self.client.request(rebuilt),
+                    )
+                    .await
+                }
             }
             other => other,
         };
@@ -1269,6 +1284,17 @@ fn upstream_client_error(error: ClientError) -> ProxyError {
     upstream_request_error(error)
 }
 
+/// May this request be replayed once if the pooled connection turns out
+/// to be dead? Only a safe method with no body: GET/HEAD/OPTIONS carry
+/// no side effect, and an empty body means nothing is lost with the
+/// consumed request. The method exclusion is pinned by unit tests —
+/// Harry's M1: with only the e2e pair, a refactor to "any method with an
+/// empty body" would replay POSTs and stay green.
+fn retryable_seed(method: &http::Method, body_exact: Option<u64>) -> bool {
+    matches!(*method, http::Method::GET | http::Method::HEAD | http::Method::OPTIONS)
+        && body_exact == Some(0)
+}
+
 /// Is this error the "pooled connection was already dead" race? Retryable
 /// means: a connection-level failure where no response bytes arrived —
 /// `is_closed` / `is_incomplete_message` from hyper, or an io reset/
@@ -1527,4 +1553,36 @@ pub fn empty_response(status: StatusCode) -> Response<ResponseBody> {
                 .boxed(),
         )
         .expect("static response is valid")
+}
+
+#[cfg(test)]
+mod retry_seed_tests {
+    use super::retryable_seed;
+
+    #[test]
+    fn safe_methods_with_empty_body_are_retryable() {
+        for method in [http::Method::GET, http::Method::HEAD, http::Method::OPTIONS] {
+            assert!(retryable_seed(&method, Some(0)), "{method} with empty body");
+        }
+    }
+
+    #[test]
+    fn writes_are_never_retryable_even_with_empty_body() {
+        // Harry's M1: the method exclusion must pin on its own — a
+        // refactor to "any method with an empty body" would replay POSTs.
+        for method in [
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::PATCH,
+            http::Method::DELETE,
+        ] {
+            assert!(!retryable_seed(&method, Some(0)), "{method} with empty body");
+        }
+    }
+
+    #[test]
+    fn a_body_or_unknown_length_is_never_retryable() {
+        assert!(!retryable_seed(&http::Method::GET, Some(5)));
+        assert!(!retryable_seed(&http::Method::GET, None));
+    }
 }
