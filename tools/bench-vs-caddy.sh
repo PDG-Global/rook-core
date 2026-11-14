@@ -92,6 +92,12 @@ http://127.0.0.1:9000 {
 	log {
 		output file $UP_LOG
 		format console
+		# The gate counts lines in this file. Caddy rolls at 100MiB by
+		# default, which at a few thousand requests per second is roughly
+		# every 15s -- mid-cell -- and a line-count diff across a roll
+		# misreads. Set the size far above any cell so the instrument
+		# cannot turn over under the measurement.
+		roll_size 10GiB
 	}
 }
 EOF
@@ -142,7 +148,19 @@ wait_port() {
     echo "nothing answered on $host:$port" >&2; return 1
 }
 
-upstream_hits() { [ -f "$UP_LOG" ] && wc -l < "$UP_LOG" | tr -d ' ' || echo 0; }
+# Count lines in the upstream access log, including any rotation
+# siblings. The roll_size above is meant to make that impossible, but a
+# counter that trusts a single inode is exactly the assumption that failed
+# once; summing the family makes the gate correct whether or not someone
+# remembers the roll_size.
+upstream_hits() {
+	local total=0 f
+	for f in "$UP_LOG" "$UP_LOG".*; do
+		[ -f "$f" ] || continue
+		total=$((total + $(wc -l < "$f")))
+	done
+	printf '%s' "$total"
+}
 
 # Fixed-count run: prints "<non2xx> <completed>". Used only by the gate.
 fixed_run() {
