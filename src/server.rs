@@ -272,6 +272,7 @@ async fn run_http(state: Arc<AppState>) -> Result<()> {
                         continue;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 let peer = canonical_peer(peer);
                 let gauge = state.metrics.connection_accepted(crate::metrics::Listener::Http);
                 let Some(permit) = state.connections.acquire(peer.ip()) else {
@@ -403,6 +404,7 @@ async fn run_https(
                         continue;
                     }
                 };
+                let _ = stream.set_nodelay(true);
                 let peer = canonical_peer(peer);
                 let gauge = state
                     .metrics

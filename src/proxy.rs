@@ -234,6 +234,15 @@ impl AppState {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(config.server.upstream_connect_timeout));
         connector.enforce_http(true);
+        // Nagle off: proxied requests are written whole and the response
+        // is wanted immediately; with it on, FreeBSD's delayed ACK adds
+        // ~100ms of wall-clock per hop with the CPU idle (measured on the
+        // n2 window 2026-11-14: same cell, 10.3k rps vs 7.2k).
+        connector.set_nodelay(true);
+        // Nagle off: proxied requests are written whole and the response
+        // is wanted immediately; with it on, FreeBSD's delayed ACK adds
+        // ~100ms of wall-clock per hop with the CPU idle (measured on the
+        // n2 window 2026-11-14: same cell, 10.3k rps vs 7.2k).
         let metrics = crate::metrics::Metrics::default();
         let blocked = config.metrics.enabled.then_some(config.metrics.listen);
         let connector = GuardedConnector {
