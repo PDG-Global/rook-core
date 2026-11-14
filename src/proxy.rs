@@ -1235,6 +1235,9 @@ fn upstream_request_error(error: impl std::error::Error) -> ProxyError {
                 "post-accept upstream error kind"
             );
         }
+        // Full chain: SendRequest with all flags false tells us nothing
+        // without the io error underneath.
+        debug!(chain = %format!("{error:?}"), "post-accept source level");
         if let Some(error) = error.downcast_ref::<std::io::Error>()
             && error.kind() == std::io::ErrorKind::TimedOut
         {
