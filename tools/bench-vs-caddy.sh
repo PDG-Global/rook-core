@@ -90,14 +90,18 @@ http://127.0.0.1:9000 {
 	root * $WORK/www
 	file_server
 	log {
-		output file $UP_LOG
-		format console
 		# The gate counts lines in this file. Caddy rolls at 100MiB by
 		# default, which at a few thousand requests per second is roughly
 		# every 15s -- mid-cell -- and a line-count diff across a roll
 		# misreads. Set the size far above any cell so the instrument
-		# cannot turn over under the measurement.
-		roll_size 10GiB
+		# cannot turn over under the measurement. roll_size is a
+		# subdirective of `output file`, not of `log` -- at log level
+		# Caddy rejects the whole config ("unrecognized subdirective")
+		# and the upstream never starts (Nathan, 2026-11-14).
+		output file $UP_LOG {
+			roll_size 10GiB
+		}
+		format console
 	}
 }
 EOF
