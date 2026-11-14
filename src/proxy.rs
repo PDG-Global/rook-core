@@ -657,6 +657,25 @@ impl AppState {
     ) -> ProxyResult {
         let _upstream_wait = upstream_wait;
         let started = std::time::Instant::now();
+        // Retry seed, captured before the request is consumed: a pooled
+        // connection that turns out to be dead (peer closed the idle
+        // socket between hyper's liveness check and the request write)
+        // may cost ONE retry, but only for a request replaying can never
+        // hurt with: a safe method and no body (Thomas/Harry, 2026-11-14).
+        // A replayed write is worse than a 502, so POST/PUT/PATCH/DELETE
+        // and any request with a body never get a second attempt.
+        let retry_seed = match *request.method() {
+            http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
+                if request.body().size_hint().exact() == Some(0) =>
+            {
+                Some((
+                    request.method().clone(),
+                    request.uri().clone(),
+                    request.headers().clone(),
+                ))
+            }
+            _ => None,
+        };
         let response = with_upload_timeout(
             &upload_tracker,
             self.config.server.request_timeout,
@@ -664,8 +683,39 @@ impl AppState {
             self.client.request(request),
         )
         .await;
+        let response = match response {
+            // Inner Err: the client call itself failed. Outer Err is the
+            // upload timeout, which is never retried (Harry: the
+            // upstream may still be working on it).
+            Ok(Err(first)) if retry_seed.is_some() && retryable_stale_connection(&first) => {
+                // The dead pooled connection is already out of hyper's
+                // pool (a failed checkout evicts it), so the second call
+                // opens a fresh connection. Same permits: concurrent
+                // upstream load does not change, and the guard is
+                // neither leaked nor double-acquired (Harry).
+                let (method, uri, headers) = retry_seed.expect("checked above");
+                self.metrics.upstream_retried();
+                debug!(%uri, "pooled upstream connection died; retrying once on a fresh connection");
+                let empty: RequestBody =
+                    Box::pin(http_body_util::Empty::new().map_err(|never| match never {}));
+                let mut rebuilt = Request::new(empty);
+                *rebuilt.method_mut() = method;
+                *rebuilt.uri_mut() = uri;
+                *rebuilt.headers_mut() = headers;
+                with_upload_timeout(
+                    &upload_tracker,
+                    self.config.server.request_timeout,
+                    self.config.server.idle_timeout,
+                    self.client.request(rebuilt),
+                )
+                .await
+            }
+            other => other,
+        };
         // Success or failure, the observation lands in the histogram:
-        // a success-only latency flatters a degrading upstream.
+        // a success-only latency flatters a degrading upstream. One
+        // observation per client request — the retry is not a second
+        // data point (Harry).
         self.metrics
             .upstream_latency(crate::metrics::UpstreamKind::Http, started.elapsed());
         let response = response?.map_err(upstream_client_error)?;
@@ -1217,6 +1267,41 @@ fn upstream_client_error(error: ClientError) -> ProxyError {
         return ProxyError::UpstreamUnavailable;
     }
     upstream_request_error(error)
+}
+
+/// Is this error the "pooled connection was already dead" race? Retryable
+/// means: a connection-level failure where no response bytes arrived —
+/// `is_closed` / `is_incomplete_message` from hyper, or an io reset/
+/// broken-pipe underneath (measured on the n2 window 2026-11-14:
+/// SendRequest wrapping `ECONNRESET`). Two exclusions carry the load
+/// (Harry): a connect error is the upstream refusing, which maps to 503
+/// and is never this race; and a timeout means the upstream may have the
+/// request and still be working on it, so retrying doubles the load on a
+/// struggling upstream — never retry a timeout.
+fn retryable_stale_connection(error: &ClientError) -> bool {
+    if error.is_connect() {
+        return false;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        if let Some(hyper_error) = error.downcast_ref::<hyper::Error>()
+            && (hyper_error.is_closed() || hyper_error.is_incomplete_message())
+        {
+            return true;
+        }
+        if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+            match io_error.kind() {
+                std::io::ErrorKind::TimedOut => return false,
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected => return true,
+                _ => {}
+            }
+        }
+        source = error.source();
+    }
+    false
 }
 
 fn upstream_request_error(error: impl std::error::Error) -> ProxyError {
