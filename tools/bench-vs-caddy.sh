@@ -190,8 +190,20 @@ gate() {
     before=$(upstream_hits)
     set -- $(fixed_run "$conc")
     non=$1
-    sleep 0.3
-    after=$(upstream_hits)
+    # The access log is the gate's instrument, so wait for it to actually
+    # settle: a fixed short sleep under-reads a freshly started Caddy,
+    # whose first writes land lazily and made the first gate of every arm
+    # report reached=0 (rook/caddy c=1 rows INVALID, 2026-11-14). Poll
+    # until two reads 0.5s apart agree (bounded).
+    after=$before
+    i=0
+    while [ $i -lt 20 ]; do
+        sleep 0.5
+        now=$(upstream_hits)
+        [ "$now" = "$after" ] && break
+        after=$now
+        i=$((i + 1))
+    done
     reached=$((after - before))
     if [ "${non:-0}" != "0" ] || [ "$reached" -lt "$GATE_REQUESTS" ]; then
         echo "INVALID ${non:-?} ${reached}"
