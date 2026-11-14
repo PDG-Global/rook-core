@@ -277,18 +277,28 @@ for proxy in rook caddy; do
             continue
         fi
         measure "$conns" >/dev/null || true   # warm-up, discarded
-        rpss=""; p50s=""; p95s=""; p99s=""; rep=0
+        # Report the median-rps REP'S WHOLE ROW. Per-column medians can
+        # invert quantiles across reps (caddy c=8 read p99<p95,
+        # 2026-11-14) — taking one rep's row keeps p50<=p95<=p99 by
+        # construction, since the source quantiles are monotone.
+        rows=""
+        rep=0
         while [ $rep -lt "$REPS" ]; do
-            set -- $(measure "$conns")
-            rpss="$rpss $1"; p50s="$p50s $2"; p95s="$p95s $3"; p99s="$p99s $4"
+            rows="$rows$(measure "$conns")
+"
             rep=$((rep + 1))
         done
-        printf '%s\t%s\tyes\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        n=$(printf '%s' "$rows" | grep -c .)
+        mid=$(( (n + 1) / 2 ))
+        medrow=$(printf '%s' "$rows" | sort -n | sed -n "${mid}p")
+        set -- $medrow
+        printf '%s	%s	yes	%s	%s	%s	%s	%s	%s
+' \
             "$proxy" "$conns" \
-            "$(median $rpss)" \
-            "$(printf '%s\n' $rpss | sort -n | head -1)" \
-            "$(printf '%s\n' $rpss | sort -n | tail -1)" \
-            "$(median $p50s)" "$(median $p95s)" "$(median $p99s)"
+            "$1" \
+            "$(printf '%s' "$rows" | sort -n | head -1 | awk '{print $1}')" \
+            "$(printf '%s' "$rows" | sort -n | tail -1 | awk '{print $1}')" \
+            "$2" "$3" "$4"
     done
 
     kill "$CUR_PROXY_PID" 2>/dev/null || true
