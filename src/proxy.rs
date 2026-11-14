@@ -239,10 +239,6 @@ impl AppState {
         // ~100ms of wall-clock per hop with the CPU idle (measured on the
         // n2 window 2026-11-14: same cell, 10.3k rps vs 7.2k).
         connector.set_nodelay(true);
-        // Nagle off: proxied requests are written whole and the response
-        // is wanted immediately; with it on, FreeBSD's delayed ACK adds
-        // ~100ms of wall-clock per hop with the CPU idle (measured on the
-        // n2 window 2026-11-14: same cell, 10.3k rps vs 7.2k).
         let metrics = crate::metrics::Metrics::default();
         let blocked = config.metrics.enabled.then_some(config.metrics.listen);
         let connector = GuardedConnector {
@@ -717,6 +713,9 @@ impl AppState {
                 };
             }
         };
+        // Small frames travel this leg interactively; Nagle would stall
+        // each unacknowledged segment against delayed ACK (Harry, #19).
+        let _ = stream.set_nodelay(true);
         // Tunnels carry no forwarding headers, so the metrics handler's
         // header guard can never fire for them: the connect-time check
         // is the only thing between a tunnel and the metrics listener.
