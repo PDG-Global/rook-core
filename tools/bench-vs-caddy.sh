@@ -177,7 +177,12 @@ fixed_run() {
             comp=$(printf '%s\n' "$out" | awk '/Complete requests/ {print $3}')
             ;;
         wrk)
-            out=$(wrk -t2 -c"$conc" -d1s "$url" 2>/dev/null || true)
+            # wrk refuses connections < threads ("number of connections
+            # must be >= threads"): at c=1 the run silently never happens
+            # and the gate correctly reports 0 reached. Scale threads
+            # down instead of letting the row die (found 2026-11-14).
+            t=$([ "$conc" -lt 2 ] && echo 1 || echo 2)
+            out=$(wrk -t"$t" -c"$conc" -d1s "$url" 2>/dev/null || true)
             non=$(printf '%s\n' "$out" | awk '/Non-2xx or 3xx/ {print $3}')
             comp=$GATE_REQUESTS
             ;;
@@ -217,7 +222,8 @@ measure() {
     conns=$1
     case $TOOL in
         wrk)
-            out=$(wrk -t2 -c"$conns" -d"${DURATION}s" --latency "http://$TARGET_HOST:$PORT/" 2>/dev/null || true)
+            t=$([ "$conns" -lt 2 ] && echo 1 || echo 2)
+            out=$(wrk -t"$t" -c"$conns" -d"${DURATION}s" --latency "http://$TARGET_HOST:$PORT/" 2>/dev/null || true)
             rps=$(printf '%s\n' "$out" | awk '/Requests\/sec/ {print $2}')
             p50=$(printf '%s\n' "$out" | awk '/50%/ {print $2}')
             p95=$(printf '%s\n' "$out" | awk '/75%/ {print $2}')
