@@ -90,14 +90,18 @@ http://127.0.0.1:9000 {
 	root * $WORK/www
 	file_server
 	log {
-		output file $UP_LOG
-		format console
 		# The gate counts lines in this file. Caddy rolls at 100MiB by
 		# default, which at a few thousand requests per second is roughly
 		# every 15s -- mid-cell -- and a line-count diff across a roll
 		# misreads. Set the size far above any cell so the instrument
-		# cannot turn over under the measurement.
-		roll_size 10GiB
+		# cannot turn over under the measurement. roll_size is a
+		# subdirective of `output file`, not of `log` -- at log level
+		# Caddy rejects the whole config ("unrecognized subdirective")
+		# and the upstream never starts (Nathan, 2026-11-14).
+		output file $UP_LOG {
+			roll_size 10GiB
+		}
+		format console
 	}
 }
 EOF
@@ -173,7 +177,12 @@ fixed_run() {
             comp=$(printf '%s\n' "$out" | awk '/Complete requests/ {print $3}')
             ;;
         wrk)
-            out=$(wrk -t2 -c"$conc" -d1s "$url" 2>/dev/null || true)
+            # wrk refuses connections < threads ("number of connections
+            # must be >= threads"): at c=1 the run silently never happens
+            # and the gate correctly reports 0 reached. Scale threads
+            # down instead of letting the row die (found 2026-11-14).
+            t=$([ "$conc" -lt 2 ] && echo 1 || echo 2)
+            out=$(wrk -t"$t" -c"$conc" -d1s "$url" 2>/dev/null || true)
             non=$(printf '%s\n' "$out" | awk '/Non-2xx or 3xx/ {print $3}')
             comp=$GATE_REQUESTS
             ;;
@@ -186,8 +195,20 @@ gate() {
     before=$(upstream_hits)
     set -- $(fixed_run "$conc")
     non=$1
-    sleep 0.3
-    after=$(upstream_hits)
+    # The access log is the gate's instrument, so wait for it to actually
+    # settle: a fixed short sleep under-reads a freshly started Caddy,
+    # whose first writes land lazily and made the first gate of every arm
+    # report reached=0 (rook/caddy c=1 rows INVALID, 2026-11-14). Poll
+    # until two reads 0.5s apart agree (bounded).
+    after=$before
+    i=0
+    while [ $i -lt 20 ]; do
+        sleep 0.5
+        now=$(upstream_hits)
+        [ "$now" = "$after" ] && break
+        after=$now
+        i=$((i + 1))
+    done
     reached=$((after - before))
     if [ "${non:-0}" != "0" ] || [ "$reached" -lt "$GATE_REQUESTS" ]; then
         echo "INVALID ${non:-?} ${reached}"
@@ -201,11 +222,25 @@ measure() {
     conns=$1
     case $TOOL in
         wrk)
-            out=$(wrk -t2 -c"$conns" -d"${DURATION}s" --latency "http://$TARGET_HOST:$PORT/" 2>/dev/null || true)
-            rps=$(printf '%s\n' "$out" | awk '/Requests\/sec/ {print $2}')
-            p50=$(printf '%s\n' "$out" | awk '/50%/ {print $2}')
-            p95=$(printf '%s\n' "$out" | awk '/75%/ {print $2}')
-            p99=$(printf '%s\n' "$out" | awk '/99%/ {print $2}')
+            t=$([ "$conns" -lt 2 ] && echo 1 || echo 2)
+            out=$(wrk -t"$t" -c"$conns" -d"${DURATION}s" --latency "http://$TARGET_HOST:$PORT/" 2>/dev/null || true)
+            # Parse ONLY the Latency Distribution block: the Thread Stats
+            # rows carry "+/- Stdev" percentages that /50%/ also matches
+            # (a stdev value was read as p50 on 2026-11-14), and the
+            # wrk's middle quantile is the 75% line — reported as p75,
+            # not p95. The ab path reads a genuine 95%.
+            rps=$(printf '%s
+' "$out" | awk '/^Requests\/sec/ {print $2}')
+            dist=$(printf '%s
+' "$out" | awk '
+                /Latency Distribution/ {f=1; next}
+                f && /^ +50%/ {p50=$2}
+                f && /^ +75%/ {p75=$2}
+                f && /^ +99%/ {p99=$2}
+                f && /^ +[0-9]/ && !/%/ {f=0}
+                END {print p50, p75, p99}')
+            p50=${dist%% *}; rest=${dist#* }
+            p75=${rest%% *}; p99=${rest##* }
             ;;
         ab)
             out=$(ab -k -t "$DURATION" -c "$conns" -n 100000000 "http://$TARGET_HOST:$PORT/" 2>/dev/null || true)
@@ -215,7 +250,7 @@ measure() {
             p99=$(printf '%s\n' "$out" | awk '$1=="99%" {print $2}')
             ;;
     esac
-    printf '%s %s %s %s\n' "${rps:-0}" "${p50:-0}" "${p95:-0}" "${p99:-0}"
+    printf '%s %s %s %s\n' "${rps:-0}" "${p50:-0}" "${p75:-${p95:-0}}" "${p99:-0}"
 }
 
 median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END { if (NR==0) print 0; else if (NR%2) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2 }'; }
@@ -235,7 +270,8 @@ case "$GENERATOR_LOCATION" in
         echo "# CAVEAT: generator shares the box under test — both numbers are a floor, not a comparison." ;;
 esac
 echo
-printf 'proxy\tconc\tvalid\trps_med\trps_min\trps_max\tp50_ms\tp95_ms\tp99_ms\n'
+printf 'proxy\tconc\tvalid\trps_med\trps_min\trps_max\tp50\tp75\tp99\n'
+# NOTE: wrk prints units inline (222us, 1.04ms) — these columns carry their own units, no _ms suffix.
 
 for proxy in rook caddy; do
     sleep 1
@@ -255,18 +291,28 @@ for proxy in rook caddy; do
             continue
         fi
         measure "$conns" >/dev/null || true   # warm-up, discarded
-        rpss=""; p50s=""; p95s=""; p99s=""; rep=0
+        # Report the median-rps REP'S WHOLE ROW. Per-column medians can
+        # invert quantiles across reps (caddy c=8 read p99<p95,
+        # 2026-11-14) — taking one rep's row keeps p50<=p95<=p99 by
+        # construction, since the source quantiles are monotone.
+        rows=""
+        rep=0
         while [ $rep -lt "$REPS" ]; do
-            set -- $(measure "$conns")
-            rpss="$rpss $1"; p50s="$p50s $2"; p95s="$p95s $3"; p99s="$p99s $4"
+            rows="${rows}$(measure "$conns")
+"
             rep=$((rep + 1))
         done
-        printf '%s\t%s\tyes\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        n=$(printf '%s' "$rows" | grep -c .)
+        mid=$(( (n + 1) / 2 ))
+        medrow=$(printf '%s' "$rows" | sort -n | sed -n "${mid}p")
+        set -- $medrow
+        printf '%s	%s	yes	%s	%s	%s	%s	%s	%s
+' \
             "$proxy" "$conns" \
-            "$(median $rpss)" \
-            "$(printf '%s\n' $rpss | sort -n | head -1)" \
-            "$(printf '%s\n' $rpss | sort -n | tail -1)" \
-            "$(median $p50s)" "$(median $p95s)" "$(median $p99s)"
+            "$1" \
+            "$(printf '%s' "$rows" | sort -n | head -1 | awk '{print $1}')" \
+            "$(printf '%s' "$rows" | sort -n | tail -1 | awk '{print $1}')" \
+            "$2" "$3" "$4"
     done
 
     kill "$CUR_PROXY_PID" 2>/dev/null || true
