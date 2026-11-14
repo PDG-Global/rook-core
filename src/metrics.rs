@@ -89,6 +89,12 @@ struct Inner {
     responses_by_class: [AtomicU64; 5],
     tls_handshake_failures: AtomicU64,
     upstream_failures: AtomicU64,
+    /// Requests retried once on a fresh connection after a pooled
+    /// connection turned out to be dead (safe methods, no body only).
+    /// A rising count means upstreams are closing idle pooled
+    /// connections — normal in small amounts (keepalive timeouts), a
+    /// symptom worth reading if it climbs.
+    upstream_retries: AtomicU64,
     /// TCP connections opened to upstreams (attempts that connected).
     /// Next to `requests` this is the churn ratio: connections opened
     /// per request should sit far below 1 at steady state — a ratio
@@ -162,6 +168,12 @@ impl Metrics {
     /// An upstream connect/request failed or timed out.
     pub fn upstream_failed(&self) {
         self.inner.upstream_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request whose pooled upstream connection died is being retried
+    /// once on a fresh connection.
+    pub fn upstream_retried(&self) {
+        self.inner.upstream_retries.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A new TCP connection to an upstream connected. Called by the
@@ -275,6 +287,11 @@ impl Metrics {
             out,
             "# HELP rook_upstream_failures_total Upstream requests that failed or timed out.\n# TYPE rook_upstream_failures_total counter\nrook_upstream_failures_total {}",
             inner.upstream_failures.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP rook_upstream_retries_total Requests retried once on a fresh upstream connection after a pooled connection died (safe methods without bodies only).\n# TYPE rook_upstream_retries_total counter\nrook_upstream_retries_total {}",
+            inner.upstream_retries.load(Ordering::Relaxed)
         );
         let _ = writeln!(
             out,

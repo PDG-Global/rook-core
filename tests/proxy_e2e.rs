@@ -3312,6 +3312,167 @@ async fn pooled_connections_drain_without_traffic() {
     );
 }
 
+/// Upstream whose FIRST connection reads the request head and then drops
+/// it unanswered — the "pooled connection was already dead" failure. Later
+/// connections serve a normal 200. Counts requests so the test can prove
+/// how many times the upstream actually saw the request.
+async fn spawn_die_once_upstream() -> (SocketAddr, Arc<AtomicUsize>, TaskGuard) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_task = Arc::clone(&requests);
+    let task = tokio::spawn(async move {
+        let first = std::sync::atomic::AtomicBool::new(true);
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let die = first.swap(false, Ordering::SeqCst);
+            let count = Arc::clone(&requests_task);
+            tokio::spawn(async move {
+                let _ = read_head(&mut stream).await;
+                count.fetch_add(1, Ordering::SeqCst);
+                if die {
+                    // Drop the connection without answering: FIN after the
+                    // head reads as an incomplete message to the client —
+                    // the class a dead pooled connection produces.
+                    return;
+                }
+                let body = b"ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            });
+        }
+    });
+    (addr, requests, TaskGuard(task))
+}
+
+#[tokio::test]
+async fn get_is_retried_once_when_pooled_connection_dies() {
+    // The race a real upstream produces at every keepalive timeout: the
+    // pooled socket is dead, the request was safe to replay (GET, no
+    // body), so the client must not see the failure. The upstream sees
+    // the request twice — replaying a GET is safe.
+    let (upstream, requests, _task) = spawn_die_once_upstream().await;
+    let rook = spawn_rook(&[upstream], "", "").await;
+    let response = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(response.status, 200, "GET must survive the dead pooled connection");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "GET reaches the upstream on both attempts"
+    );
+}
+
+#[tokio::test]
+async fn post_is_never_retried_and_reaches_upstream_exactly_once() {
+    // Same dead connection, but a replayed write is worse than a 502
+    // (Thomas): the POST fails once, the client sees 502, and the
+    // upstream saw the request exactly once.
+    let (upstream, requests, _task) = spawn_die_once_upstream().await;
+    let rook = spawn_rook(&[upstream], "", "").await;
+    let response = send_request(
+        rook.addr,
+        "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody",
+    )
+    .await;
+    assert_eq!(response.status, 502, "POST must not be retried");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "POST reaches the upstream exactly once"
+    );
+}
+
+/// Upstream that accepts, reads the head, and never answers.
+async fn spawn_stall_upstream() -> (SocketAddr, Arc<AtomicUsize>, TaskGuard) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_task = Arc::clone(&requests);
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let count = Arc::clone(&requests_task);
+            tokio::spawn(async move {
+                let _ = read_head(&mut stream).await;
+                count.fetch_add(1, Ordering::SeqCst);
+                // Never answer; hold the socket so the client waits.
+                let mut buf = [0u8; 1];
+                let _ = stream.read(&mut buf).await;
+            });
+        }
+    });
+    (addr, requests, TaskGuard(task))
+}
+
+#[tokio::test]
+async fn a_timeout_is_never_retried() {
+    // Harry's M2: a stalled upstream means the request may still be
+    // worked on; retrying doubles the load on a struggling upstream.
+    // The client sees the timeout (504), the upstream saw exactly one
+    // attempt, and the retry counter did not move.
+    let (upstream, requests, _task) = spawn_stall_upstream().await;
+    let metrics = free_addr().await;
+    let rook = spawn_rook(
+        &[upstream],
+        // request_timeout must sit below the harness's own 2s read
+        // timeout, with margin for a loaded machine.
+        &format!(
+            "request_timeout = 1\n\n[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"
+        ),
+        "",
+    )
+    .await;
+    let retries_before = metric_value(metrics, "rook_upstream_retries_total").await;
+    let response = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(response.status, 504, "a stalled upstream reads as a timeout");
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "one attempt only");
+    let retries_after = metric_value(metrics, "rook_upstream_retries_total").await;
+    assert_eq!(retries_after, retries_before, "no retry on a timeout");
+}
+
+#[tokio::test]
+async fn post_with_empty_body_is_not_retried() {
+    // The e2e half of Harry's M1: an empty body must not make a POST
+    // replayable. The unit tests pin the predicate; this pins the
+    // wiring. The die-once upstream reads the head (one request seen),
+    // drops the connection, and the client must get the 502 with the
+    // retry counter unmoved.
+    let (upstream, requests, _task) = spawn_die_once_upstream().await;
+    let metrics = free_addr().await;
+    let rook = spawn_rook(
+        &[upstream],
+        &format!("[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"),
+        "",
+    )
+    .await;
+    let retries_before = metric_value(metrics, "rook_upstream_retries_total").await;
+    let response = send_request(
+        rook.addr,
+        "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(response.status, 502, "an empty-bodied POST is still a write");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "the POST was not replayed"
+    );
+    let retries_after = metric_value(metrics, "rook_upstream_retries_total").await;
+    assert_eq!(retries_after, retries_before);
+}
+
 /// Scrape a counter off the metrics listener.
 async fn metric_value(addr: SocketAddr, name: &str) -> u64 {
     let response = send_request(
