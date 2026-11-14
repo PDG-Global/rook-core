@@ -1,6 +1,9 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -3232,6 +3235,83 @@ async fn spawn_keepalive_upstream() -> (SocketAddr, TaskGuard) {
     (addr, TaskGuard(task))
 }
 
+/// A keep-alive upstream that also exposes its live connection count,
+/// so tests can observe sockets closing without sending any request.
+async fn spawn_counting_keepalive_upstream() -> (SocketAddr, Arc<AtomicUsize>, TaskGuard) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let live = Arc::new(AtomicUsize::new(0));
+    let live_task = Arc::clone(&live);
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let live_conn = Arc::clone(&live_task);
+            tokio::spawn(async move {
+                live_conn.fetch_add(1, Ordering::SeqCst);
+                let _guard = LiveGuard(live_conn);
+                loop {
+                    let mut peek = [0u8; 1];
+                    match stream.peek(&mut peek).await {
+                        Ok(0) | Err(_) => return, // peer closed
+                        Ok(_) => {}
+                    }
+                    let _ = read_head(&mut stream).await;
+                    let body = b"ok";
+                    let response =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(body).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, live, TaskGuard(task))
+}
+
+struct LiveGuard(Arc<AtomicUsize>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn pooled_connections_drain_without_traffic() {
+    // Thomas's no-traffic drain test (2026-11-14): after load stops,
+    // with NO further requests, the idle reaper must close pooled
+    // upstream connections within the timeout. Harry's timing note:
+    // the reaper ticks every max(timeout, 90ms), so an entry expiring
+    // just after a tick waits for the next — wait past 2x. Red-proved:
+    // without `.pool_timer(..)` the count never falls.
+    let (upstream, live, _upstream_task) = spawn_counting_keepalive_upstream().await;
+    let rook = spawn_rook(&[upstream], "upstream_pool_idle_timeout = 1\n", "").await;
+
+    let r = send_request(
+        rook.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        1,
+        "request did not pool a connection"
+    );
+
+    // No traffic at all: only the background reaper can close it.
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        0,
+        "pooled connection still open 3s after a 1s idle timeout with no traffic"
+    );
+}
+
 /// Scrape a counter off the metrics listener.
 async fn metric_value(addr: SocketAddr, name: &str) -> u64 {
     let response = send_request(
@@ -3317,7 +3397,9 @@ async fn pooled_connections_expire_after_the_idle_timeout() {
     let metrics = free_addr().await;
     let rook = spawn_rook(
         &[upstream],
-        &format!("upstream_pool_idle_timeout = 2\n\n[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"),
+        &format!(
+            "upstream_pool_idle_timeout = 2\n\n[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"
+        ),
         "",
     )
     .await;
