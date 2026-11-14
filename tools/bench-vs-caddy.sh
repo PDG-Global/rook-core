@@ -224,10 +224,23 @@ measure() {
         wrk)
             t=$([ "$conns" -lt 2 ] && echo 1 || echo 2)
             out=$(wrk -t"$t" -c"$conns" -d"${DURATION}s" --latency "http://$TARGET_HOST:$PORT/" 2>/dev/null || true)
-            rps=$(printf '%s\n' "$out" | awk '/Requests\/sec/ {print $2}')
-            p50=$(printf '%s\n' "$out" | awk '/50%/ {print $2}')
-            p95=$(printf '%s\n' "$out" | awk '/75%/ {print $2}')
-            p99=$(printf '%s\n' "$out" | awk '/99%/ {print $2}')
+            # Parse ONLY the Latency Distribution block: the Thread Stats
+            # rows carry "+/- Stdev" percentages that /50%/ also matches
+            # (a stdev value was read as p50 on 2026-11-14), and the
+            # column historically labelled p95 is wrk's 75% line — kept,
+            # since the harness has always reported it, but named.
+            rps=$(printf '%s
+' "$out" | awk '/^Requests\/sec/ {print $2}')
+            dist=$(printf '%s
+' "$out" | awk '
+                /Latency Distribution/ {f=1; next}
+                f && /^ +50%/ {p50=$2}
+                f && /^ +75%/ {p75=$2}
+                f && /^ +99%/ {p99=$2}
+                f && /^ +[0-9]/ && !/%/ {f=0}
+                END {print p50, p75, p99}')
+            p50=${dist%% *}; rest=${dist#* }
+            p95=${rest%% *}; p99=${rest##* }
             ;;
         ab)
             out=$(ab -k -t "$DURATION" -c "$conns" -n 100000000 "http://$TARGET_HOST:$PORT/" 2>/dev/null || true)
@@ -284,7 +297,7 @@ for proxy in rook caddy; do
         rows=""
         rep=0
         while [ $rep -lt "$REPS" ]; do
-            rows="$rows$(measure "$conns")
+            rows="${rows}$(measure "$conns")
 "
             rep=$((rep + 1))
         done
