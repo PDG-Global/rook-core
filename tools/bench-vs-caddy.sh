@@ -227,8 +227,8 @@ measure() {
             # Parse ONLY the Latency Distribution block: the Thread Stats
             # rows carry "+/- Stdev" percentages that /50%/ also matches
             # (a stdev value was read as p50 on 2026-11-14), and the
-            # column historically labelled p95 is wrk's 75% line — kept,
-            # since the harness has always reported it, but named.
+            # wrk's middle quantile is the 75% line — reported as p75,
+            # not p95. The ab path reads a genuine 95%.
             rps=$(printf '%s
 ' "$out" | awk '/^Requests\/sec/ {print $2}')
             dist=$(printf '%s
@@ -240,7 +240,7 @@ measure() {
                 f && /^ +[0-9]/ && !/%/ {f=0}
                 END {print p50, p75, p99}')
             p50=${dist%% *}; rest=${dist#* }
-            p95=${rest%% *}; p99=${rest##* }
+            p75=${rest%% *}; p99=${rest##* }
             ;;
         ab)
             out=$(ab -k -t "$DURATION" -c "$conns" -n 100000000 "http://$TARGET_HOST:$PORT/" 2>/dev/null || true)
@@ -250,7 +250,7 @@ measure() {
             p99=$(printf '%s\n' "$out" | awk '$1=="99%" {print $2}')
             ;;
     esac
-    printf '%s %s %s %s\n' "${rps:-0}" "${p50:-0}" "${p95:-0}" "${p99:-0}"
+    printf '%s %s %s %s\n' "${rps:-0}" "${p50:-0}" "${p75:-${p95:-0}}" "${p99:-0}"
 }
 
 median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END { if (NR==0) print 0; else if (NR%2) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2 }'; }
@@ -270,7 +270,8 @@ case "$GENERATOR_LOCATION" in
         echo "# CAVEAT: generator shares the box under test — both numbers are a floor, not a comparison." ;;
 esac
 echo
-printf 'proxy\tconc\tvalid\trps_med\trps_min\trps_max\tp50_ms\tp95_ms\tp99_ms\n'
+printf 'proxy\tconc\tvalid\trps_med\trps_min\trps_max\tp50\tp75\tp99\n'
+# NOTE: wrk prints units inline (222us, 1.04ms) — these columns carry their own units, no _ms suffix.
 
 for proxy in rook caddy; do
     sleep 1
