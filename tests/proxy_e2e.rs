@@ -3422,6 +3422,8 @@ async fn a_timeout_is_never_retried() {
     let metrics = free_addr().await;
     let rook = spawn_rook(
         &[upstream],
+        // request_timeout must sit below the harness's own 2s read
+        // timeout, with margin for a loaded machine.
         &format!(
             "request_timeout = 1\n\n[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"
         ),
