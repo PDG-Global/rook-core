@@ -1223,6 +1223,18 @@ fn upstream_request_error(error: impl std::error::Error) -> ProxyError {
     debug!(error = %error, "upstream request failed");
     let mut source = std::error::Error::source(&error);
     while let Some(error) = source {
+        if let Some(hyper_error) = error.downcast_ref::<hyper::Error>() {
+            // Diagnostic only (Thomas, before any 502 may be published):
+            // which hyper kind produced a post-accept failure. Control
+            // flow below still maps by io::ErrorKind.
+            debug!(
+                canceled = hyper_error.is_canceled(),
+                closed = hyper_error.is_closed(),
+                incomplete = hyper_error.is_incomplete_message(),
+                timeout = hyper_error.is_timeout(),
+                "post-accept upstream error kind"
+            );
+        }
         if let Some(error) = error.downcast_ref::<std::io::Error>()
             && error.kind() == std::io::ErrorKind::TimedOut
         {
