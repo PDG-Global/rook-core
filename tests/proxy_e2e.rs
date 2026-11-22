@@ -3362,7 +3362,10 @@ async fn get_is_retried_once_when_pooled_connection_dies() {
         "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
     .await;
-    assert_eq!(response.status, 200, "GET must survive the dead pooled connection");
+    assert_eq!(
+        response.status, 200,
+        "GET must survive the dead pooled connection"
+    );
     assert_eq!(
         requests.load(Ordering::SeqCst),
         2,
@@ -3424,9 +3427,7 @@ async fn a_timeout_is_never_retried() {
         &[upstream],
         // request_timeout must sit below the harness's own 2s read
         // timeout, with margin for a loaded machine.
-        &format!(
-            "request_timeout = 1\n\n[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"
-        ),
+        &format!("request_timeout = 1\n\n[metrics]\nenabled = true\nlisten = \"{metrics}\"\n"),
         "",
     )
     .await;
@@ -3436,7 +3437,10 @@ async fn a_timeout_is_never_retried() {
         "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
     )
     .await;
-    assert_eq!(response.status, 504, "a stalled upstream reads as a timeout");
+    assert_eq!(
+        response.status, 504,
+        "a stalled upstream reads as a timeout"
+    );
     assert_eq!(requests.load(Ordering::SeqCst), 1, "one attempt only");
     let retries_after = metric_value(metrics, "rook_upstream_retries_total").await;
     assert_eq!(retries_after, retries_before, "no retry on a timeout");
@@ -3463,7 +3467,10 @@ async fn post_with_empty_body_is_not_retried() {
         "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     )
     .await;
-    assert_eq!(response.status, 502, "an empty-bodied POST is still a write");
+    assert_eq!(
+        response.status, 502,
+        "an empty-bodied POST is still a write"
+    );
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
@@ -3617,4 +3624,91 @@ async fn upstream_connect_refusal_is_503_with_retry_after() {
     .await;
     assert_eq!(r.status, 503);
     assert_eq!(r.header("retry-after"), Some("1"));
+}
+
+#[tokio::test]
+async fn trap_path_strikes_before_static_dispatch() {
+    // A static site has no routes, so anything hanging off the route
+    // lookup would never run for it. Strikes and trap paths must fire
+    // BEFORE the static dispatch: one hit on the trap (threshold 1)
+    // must ban the client even though the site serves files.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "hello").unwrap();
+    for _ in 0..5 {
+        let addr = free_addr().await;
+        let input = format!(
+            r#"
+[server]
+listen = "{addr}"
+
+[[sites]]
+hosts = ["example.com"]
+root = "{root}"
+
+[sites.strikes]
+enabled = true
+log_only = false
+threshold = 1
+window_secs = 60
+ban_secs = 60
+trap_paths = ["/wp-admin"]
+"#,
+            root = dir.path().display()
+        );
+        let config = Config::parse(&input).unwrap();
+        let task = tokio::spawn(async move {
+            server::run(config).await.unwrap();
+        });
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let mut bound = false;
+        while Instant::now() < deadline {
+            if task.is_finished() {
+                break;
+            }
+            if let Ok(Ok(stream)) =
+                timeout(Duration::from_millis(50), TcpStream::connect(addr)).await
+            {
+                drop(stream);
+                sleep(Duration::from_millis(10)).await;
+                bound = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        if !bound {
+            task.abort();
+            continue;
+        }
+        let _server = RookServer {
+            addr,
+            _task: TaskGuard(task),
+        };
+        // The static site serves files...
+        let ok = send_request(
+            addr,
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(ok.status, 200, "static site serves: {}", ok.raw_head);
+        // ...the trap path answers 404 like any unknown static path...
+        let trap = send_request(
+            addr,
+            "GET /wp-admin HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(trap.status, 404, "trap path: {}", trap.raw_head);
+        // ...but the strike ran first: threshold 1 bans the client.
+        let banned = send_request(
+            addr,
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            banned.status, 403,
+            "trap strike must ban before static dispatch: {}",
+            banned.raw_head
+        );
+        return;
+    }
+    panic!("Rook could not bind a free loopback port after five attempts");
 }

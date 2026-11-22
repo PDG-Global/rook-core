@@ -717,6 +717,7 @@ D0gQNmyHayjWoyvGpiGtQMHrGw==\n\
         SiteConfig {
             acme: None,
             hosts: vec![host.to_owned()],
+            root: None,
             tls_cert: Some(paths.0.clone()),
             tls_key: Some(paths.1.clone()),
             routes: vec![],
@@ -764,6 +765,7 @@ D0gQNmyHayjWoyvGpiGtQMHrGw==\n\
                 renew_before_days: 30,
             }),
             hosts: vec!["example.com".to_owned()],
+            root: None,
             tls_cert: None,
             tls_key: None,
             strikes: crate::config::StrikeRulesConfig::default(),

@@ -185,6 +185,9 @@ pub struct AppState {
 
 struct Site {
     routes: Vec<Route>,
+    /// Static file root; the site serves files instead of proxying when
+    /// set (config guarantees root and routes are mutually exclusive).
+    root: Option<std::path::PathBuf>,
     redirect_https: bool,
     /// The site's strike rules; `None` when the site leaves them
     /// disabled.
@@ -305,6 +308,7 @@ impl AppState {
             });
             let site = Arc::new(Site {
                 routes,
+                root: site_config.root.clone(),
                 redirect_https: config.server.https_listen.is_some(),
                 strikes,
                 trap_paths: site_config.strikes.trap_paths.iter().cloned().collect(),
@@ -541,6 +545,15 @@ impl AppState {
                 port,
             ));
         }
+        if let Some(root) = &site.root {
+            return Ok(crate::static_files::serve(
+                root,
+                request.method(),
+                &path,
+                request.headers(),
+            )
+            .await);
+        }
         let route = site.route(&path).ok_or(ProxyError::NotFound)?;
         let rate = route
             .config
@@ -664,16 +677,15 @@ impl AppState {
         // hurt with: a safe method and no body (Thomas/Harry, 2026-11-14).
         // A replayed write is worse than a 502, so POST/PUT/PATCH/DELETE
         // and any request with a body never get a second attempt.
-        let retry_seed =
-            if retryable_seed(request.method(), request.body().size_hint().exact()) {
-                Some((
-                    request.method().clone(),
-                    request.uri().clone(),
-                    request.headers().clone(),
-                ))
-            } else {
-                None
-            };
+        let retry_seed = if retryable_seed(request.method(), request.body().size_hint().exact()) {
+            Some((
+                request.method().clone(),
+                request.uri().clone(),
+                request.headers().clone(),
+            ))
+        } else {
+            None
+        };
         let response = with_upload_timeout(
             &upload_tracker,
             self.config.server.request_timeout,
@@ -709,7 +721,10 @@ impl AppState {
                     self.metrics.upstream_retried();
                     // Path only: a full URI puts the query string in the
                     // log, and query strings carry tokens (Thomas/Harry).
-                    debug!(path = uri.path(), "pooled upstream connection died; retrying once on a fresh connection");
+                    debug!(
+                        path = uri.path(),
+                        "pooled upstream connection died; retrying once on a fresh connection"
+                    );
                     let empty: RequestBody =
                         Box::pin(http_body_util::Empty::new().map_err(|never| match never {}));
                     let mut rebuilt = Request::new(empty);
@@ -1291,8 +1306,10 @@ fn upstream_client_error(error: ClientError) -> ProxyError {
 /// Harry's M1: with only the e2e pair, a refactor to "any method with an
 /// empty body" would replay POSTs and stay green.
 fn retryable_seed(method: &http::Method, body_exact: Option<u64>) -> bool {
-    matches!(*method, http::Method::GET | http::Method::HEAD | http::Method::OPTIONS)
-        && body_exact == Some(0)
+    matches!(
+        *method,
+        http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
+    ) && body_exact == Some(0)
 }
 
 /// Is this error the "pooled connection was already dead" race? Retryable
@@ -1576,7 +1593,10 @@ mod retry_seed_tests {
             http::Method::PATCH,
             http::Method::DELETE,
         ] {
-            assert!(!retryable_seed(&method, Some(0)), "{method} with empty body");
+            assert!(
+                !retryable_seed(&method, Some(0)),
+                "{method} with empty body"
+            );
         }
     }
 

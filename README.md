@@ -147,7 +147,8 @@ Unknown fields are rejected. Durations are integer seconds and all limits/timeou
 ### `[[sites]]`
 
 - `hosts` (required): nonempty list of DNS names or IPv4 literals. Names are case-insensitive, normalized to lowercase, and cannot contain ports or wildcards. Every host must be unique across the configuration.
-- `routes` (required): at least one `[[sites.routes]]` block. Longest matching path prefix wins.
+- `routes`: at least one `[[sites.routes]]` block; required unless `root` is set. Longest matching path prefix wins.
+- `root`: optional absolute directory path. When set, the site serves static files from that directory instead of proxying; `routes` must then be empty. GET and HEAD only; `index.html` is served for directories; there is no directory listing. Every path segment is re-validated at the file layer (no dot segments, dotfiles, `~`/`.bak` leftovers, or stray `%`/`\`/control bytes), and the resolved path is canonicalized and required to stay under the root, so symlinks cannot escape it. Files larger than 32 MiB are refused. Content types come from a closed extension set with `X-Content-Type-Options: nosniff`; unknown extensions are `application/octet-stream`.
 - `tls_cert`, `tls_key`: optional supplied certificate chain and private key paths. They must be provided as a pair.
 - `[sites.acme]`: optional ACME configuration. With HTTPS enabled, each site needs supplied files, ACME, or both. With HTTPS disabled, neither may be configured.
 
