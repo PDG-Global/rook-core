@@ -1182,6 +1182,22 @@ async fn content_length_above_configured_max_returns_413() {
 }
 
 #[tokio::test]
+async fn chunked_body_above_configured_max_returns_413() {
+    // The Content-Length variant above pins the declared-size check;
+    // this pins the streamed path: the cap trips mid-upload inside the
+    // Limited body, and the client still gets 413, never a 502.
+    let (upstream, _request_rx, _upstream_task) =
+        spawn_capture_upstream("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_owned()).await;
+    let rook = spawn_rook(&[upstream], "max_request_body_bytes = 4", "").await;
+    let response = send_request(
+        rook.addr,
+        "POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n12345\r\n0\r\n\r\n",
+    )
+    .await;
+    assert_error_response(&response, 413, upstream);
+}
+
+#[tokio::test]
 async fn unreachable_upstream_returns_503_without_upstream_details() {
     let upstream = free_addr().await;
     let rook = spawn_rook(&[upstream], "", "").await;
