@@ -110,6 +110,9 @@ pub struct AcmeConfig {
 pub struct SiteConfig {
     pub acme: Option<AcmeConfig>,
     pub hosts: Vec<String>,
+    /// Serve static files from this directory (GET/HEAD only). Mutually
+    /// exclusive with `routes`.
+    pub root: Option<PathBuf>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub routes: Vec<RouteConfig>,
@@ -438,6 +441,7 @@ impl Default for RawAcmeConfig {
 struct RawSiteConfig {
     acme: Option<RawAcmeConfig>,
     hosts: Vec<String>,
+    root: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     routes: Vec<RawRouteConfig>,
@@ -797,10 +801,53 @@ fn parse_site(
             "at least one host is required",
         ));
     }
-    if raw.routes.is_empty() {
+    let root = raw
+        .root
+        .as_deref()
+        .map(|root| {
+            let path = PathBuf::from(root);
+            if !path.is_absolute() {
+                return Err(validation(
+                    format!("sites[{site_index}].root"),
+                    "must be an absolute path",
+                ));
+            }
+            // Resolve once, at load: a root that is missing, not a
+            // directory, or itself a symlink is refused here (so
+            // `rookd --check`, and with it the rc.d start gate, catches
+            // it) rather than showing up as runtime 404s. Requests are
+            // checked against the canonical path; a symlink in a PARENT
+            // component is fine and simply resolves.
+            if std::fs::symlink_metadata(&path)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(validation(
+                    format!("sites[{site_index}].root"),
+                    "must be a real directory, not a symlink",
+                ));
+            }
+            let canonical = std::fs::canonicalize(&path)
+                .map_err(|_| validation(format!("sites[{site_index}].root"), "does not exist"))?;
+            if !canonical.is_dir() {
+                return Err(validation(
+                    format!("sites[{site_index}].root"),
+                    "must be a directory",
+                ));
+            }
+            Ok(canonical)
+        })
+        .transpose()?;
+    if root.is_some() && !raw.routes.is_empty() {
+        return Err(validation(
+            format!("sites[{site_index}].root"),
+            "root serves the whole site; it cannot be combined with routes",
+        ));
+    }
+    if root.is_none() && raw.routes.is_empty() {
         return Err(validation(
             format!("sites[{site_index}].routes"),
-            "at least one route is required",
+            "at least one route is required (or set root to serve files)",
         ));
     }
 
@@ -956,6 +1003,7 @@ fn parse_site(
     Ok(SiteConfig {
         acme,
         hosts,
+        root,
         tls_cert,
         tls_key,
         routes,
@@ -1849,10 +1897,7 @@ upstreams = ["http://127.0.0.1"]
         assert_eq!(config.server.upstream_pool_idle, 1024);
 
         // The client cap binds when it is the smaller one.
-        let small_clients = format!(
-            "[server]\nmax_connections = 10\n{}",
-            minimal_config()
-        );
+        let small_clients = format!("[server]\nmax_connections = 10\n{}", minimal_config());
         assert_eq!(
             Config::parse(&small_clients)
                 .unwrap()
@@ -1895,7 +1940,10 @@ upstreams = ["http://127.0.0.1"]
             minimal_config()
         );
         assert_eq!(
-            Config::parse(&set).unwrap().server.upstream_pool_idle_timeout,
+            Config::parse(&set)
+                .unwrap()
+                .server
+                .upstream_pool_idle_timeout,
             Duration::from_secs(5)
         );
 
@@ -2017,6 +2065,45 @@ upstreams = ["http://127.0.0.1"]
                 assert!(error.to_string().contains("metrics.listen"), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn site_root_serves_files_and_rejects_routes() {
+        // A file-serving site needs no routes. The root must be a real
+        // directory at load time, so use one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_str().expect("utf8 tempdir");
+        let input = format!("\n[[sites]]\nhosts = [\"example.com\"]\nroot = \"{root}\"\n");
+        let config = Config::parse(&input).expect("root-only site parses");
+        let canonical = std::fs::canonicalize(dir.path()).expect("canonical tempdir");
+        assert_eq!(config.sites[0].root.as_deref(), Some(canonical.as_path()));
+
+        // But it cannot ALSO proxy: the two must never mix.
+        let mixed = format!(
+            "\n[[sites]]\nhosts = [\"example.com\"]\nroot = \"{root}\"\n\n[[sites.routes]]\nprefix = \"/\"\nupstreams = [\"http://127.0.0.1:8080\"]\n"
+        );
+        assert!(Config::parse(&mixed).is_err());
+
+        // The root must be absolute, must exist, and must not be a
+        // symlink or a file.
+        let relative = "\n[[sites]]\nhosts = [\"example.com\"]\nroot = \"www/example\"\n";
+        assert!(Config::parse(relative).is_err());
+        let missing = "\n[[sites]]\nhosts = [\"example.com\"]\nroot = \"/nonexistent-rook-root\"\n";
+        assert!(Config::parse(missing).is_err());
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").expect("file");
+        let as_file = format!(
+            "\n[[sites]]\nhosts = [\"example.com\"]\nroot = \"{}\"\n",
+            file.display()
+        );
+        assert!(Config::parse(&as_file).is_err());
+        let link = dir.path().join("a-link");
+        std::os::unix::fs::symlink(dir.path(), &link).expect("symlink");
+        let as_link = format!(
+            "\n[[sites]]\nhosts = [\"example.com\"]\nroot = \"{}\"\n",
+            link.display()
+        );
+        assert!(Config::parse(&as_link).is_err());
     }
 
     #[test]

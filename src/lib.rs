@@ -11,5 +11,6 @@ pub mod metrics;
 pub mod path;
 pub mod proxy;
 pub mod server;
+pub mod static_files;
 pub mod strike;
 pub mod trust;

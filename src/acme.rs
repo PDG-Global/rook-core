@@ -776,6 +776,7 @@ PBU0gcD3kQT2VvHSYVcBmgMTfj5wcNOajJLtTQfhA5bdHDnZ2u5586JTMyuM7va5\n\
                 renew_before_days: 30,
             }),
             hosts: vec!["example.com".to_owned(), "api.example.com".to_owned()],
+            root: None,
             tls_cert: None,
             tls_key: None,
             routes: Vec::new(),
