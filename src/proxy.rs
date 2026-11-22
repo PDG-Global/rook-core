@@ -1366,6 +1366,12 @@ fn upstream_request_error(error: impl std::error::Error) -> ProxyError {
         // Full chain: SendRequest with all flags false tells us nothing
         // without the io error underneath.
         debug!(chain = %format!("{error:?}"), "post-accept source level");
+        // A streamed body tripping the size cap surfaces mid-send as
+        // http-body's LengthLimitError: that is the client's 413, not
+        // the upstream's 502.
+        if error.is::<http_body_util::LengthLimitError>() {
+            return ProxyError::BodyTooLarge;
+        }
         if let Some(error) = error.downcast_ref::<std::io::Error>()
             && error.kind() == std::io::ErrorKind::TimedOut
         {
