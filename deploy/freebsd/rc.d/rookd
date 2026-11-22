@@ -1,0 +1,63 @@
+#!/bin/sh
+
+# PROVIDE: rookd
+# REQUIRE: NETWORKING syslogd
+# KEYWORD: shutdown
+#
+# rookd_enable="YES" in /etc/rc.conf to start at boot.
+# Optional:
+#   rookd_config (default /usr/local/etc/rook/rookd.toml)
+#   rookd_runas  (default rookd; must exist and hold the mac_portacl
+#                 rules for tcp:80,443 — see deploy/freebsd/README.md)
+#
+# Deliberate choices:
+# - The run-as knob is rookd_runas, NOT rookd_user: rc.subr treats
+#   ${name}_user as reserved and would su the whole command (daemon(8)
+#   included) to that user, breaking the pidfile and the setuid child.
+#   daemon(8) stays root as supervisor; only the server child runs
+#   unprivileged via -u.
+# - daemon -o logs the child straight to /var/log/rookd.log and -H makes
+#   the SUPERVISOR reopen that file on SIGHUP, so newsyslog rotation is
+#   safe (without -H the stream strands in the rotated file — verified on
+#   rook-test-01). No syslog in the path; no shell pipeline, so the child
+#   IS rookd, the child pidfile is rookd's own pid, and stop is a clean
+#   TERM to rookd. (A logger pipeline made the child /bin/sh, and a TERM
+#   to the supervisor orphaned rookd — also verified on the box.)
+# - No reload command: rookd reloads replaced certificates on its own
+#   2s poll.
+
+. /etc/rc.subr
+
+name=rookd
+rcvar=rookd_enable
+desc="Rook HTTP reverse proxy"
+
+load_rc_config $name
+: ${rookd_enable:=NO}
+: ${rookd_config:=/usr/local/etc/rook/rookd.toml}
+: ${rookd_runas:=rookd}
+
+# rc.subr signals the CHILD pidfile (rookd itself, which shuts down
+# gracefully on TERM). The supervisor pidfile exists only for newsyslog's
+# HUP (the -H reopen). A TERM to the supervisor instead would orphan
+# rookd — verified on rook-test-01, where that left the port bound.
+: ${rookd_log:=/var/log/rookd.log}
+pidfile=/var/run/rookd/${name}.pid
+supervisor_pidfile=/var/run/rookd/${name}.supervisor.pid
+rookd_bin=/usr/local/sbin/rookd
+procname=${rookd_bin}
+start_precmd=rookd_precmd
+
+command=/usr/sbin/daemon
+command_args="-f -H -p ${pidfile} -P ${supervisor_pidfile} -u ${rookd_runas} -o ${rookd_log} ${rookd_bin} --config ${rookd_config}"
+
+rookd_precmd()
+{
+    # Refuse to start on an invalid config; `rookd --check` runs the same
+    # parse and local validation the daemon path does, on the same file.
+    ${rookd_bin} --config "${rookd_config}" --check || \
+        err 1 "rookd: configuration ${rookd_config} failed validation"
+    install -d -o root -g wheel -m 0755 /var/run/rookd
+}
+
+run_rc_command "$1"
