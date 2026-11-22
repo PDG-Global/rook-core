@@ -16,7 +16,8 @@ pw useradd -n rookd -c "Rook HTTP reverse proxy" -d /nonexistent -s /usr/sbin/no
 # config
 install -d -m 0750 -o root -g rookd /usr/local/etc/rook
 install -m 0640 -o root -g rookd rookd.example.toml /usr/local/etc/rook/rookd.toml   # then edit
-# TLS material: 0640 root:rookd — the key never leaves the box and never
+# TLS material: 0600 rookd:rookd — the daemon rejects a key with any
+# group or other bit set. The key never leaves the box and never
 # enters chat, a ticket, or a repo.
 
 # service + log rotation
