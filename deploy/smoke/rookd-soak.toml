@@ -1,0 +1,36 @@
+[server]
+listen = "0.0.0.0:80"
+https_listen = "0.0.0.0:443"
+
+[metrics]
+enabled = true
+listen = "127.0.0.1:9188"
+
+[[sites]]
+hosts = ["example.com"]
+
+[sites.acme]
+contact = "mailto:security@pdg-global.com"
+directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+state_dir = "/var/db/rookd-acme"
+trusted_root = "/usr/local/share/certs/ca-root-nss.crt"
+renew_before_days = 30
+
+[sites.strikes]
+enabled = true
+log_only = true
+threshold = 5
+window_secs = 600
+ban_secs = 3600
+trap_paths = ["/wp-admin"]
+
+[[sites.routes]]
+prefix = "/"
+upstreams = ["http://127.0.0.1:9000"]
+websocket = true
+
+# Soak: WebSocket route to the echo upstream (added 2026-11-12 for the 24h soak)
+[[sites.routes]]
+prefix = "/ws"
+upstreams = ["http://127.0.0.1:9001"]
+websocket = true

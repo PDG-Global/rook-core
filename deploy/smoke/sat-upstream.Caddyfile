@@ -1,0 +1,10 @@
+{
+	admin off
+	auto_https off
+}
+http://:9000 {
+	bind 127.0.0.1
+	root * ./sat-www
+	file_server
+	log off
+}
