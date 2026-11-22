@@ -360,6 +360,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_regular_files_are_refused() {
+        // Pins the `canonical.is_file()` guard: without it a FIFO in
+        // the tree would hang the read. `git archive` cannot emit one,
+        // so this only becomes real through a refactor dropping the
+        // check.
+        let dir = tree();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+        // A dropped `is_file()` guard must fail fast, not hang the
+        // suite (Thomas): the delayed writer below turns a guardless
+        // read into junk bytes and a wrong status, and the timeout is
+        // the last resort if even that stalls.
+        std::thread::spawn({
+            let fifo = fifo.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let _ = std::fs::write(&fifo, b"x");
+            }
+        });
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            serve(dir.path(), &Method::GET, "/pipe", &HeaderMap::new()),
+        )
+        .await
+        .expect("serve answers a FIFO within 2s");
+        let (status, _) = body_text(response).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn head_sends_headers_without_body() {
         let dir = tree();
         let response = serve(dir.path(), &Method::HEAD, "/index.html", &HeaderMap::new()).await;
